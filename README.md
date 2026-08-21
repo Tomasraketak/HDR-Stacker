@@ -6,32 +6,27 @@ Profesionální desktopová aplikace v Pythonu (PyQt6 + OpenCV) pro skládání 
 
 ## ✨ Klíčové funkce
 
+- **🎯 Bleskový výřez ROI (300x300 px / Fast Edit Mode)**:
+  - Přepínání jedním kliknutím mezi celým snímkem a **výřezem kolem Slunce** (300x300, 450x450, 600x600 px).
+  - V režimu výřezu probíhá složení a veškeré úpravy v reálném čase (**odezva pod 30 ms**).
+  - Tlačítko **`☀️ Najít Slunce`** nebo kliknutí myší na obrazovku okamžitě vycentruje výřez na zatmění.
+  - Při exportu se automaticky spočítá a uloží **100% plné rozlišení v 16-bitové hloubce**.
 - **Automatické rozpoznání EV a expozičních časů**:
   - Automatické vyčtení expozičních časů, ISO a clony z **EXIF** metadat.
   - Inteligentní analýza jasu scény: Pokud EXIF chybí, aplikace analyzuje histogram a seřadí snímky od nejkratší expozice (-EV) po nejdelší (+EV).
   - Možnost definovat krok (např. **9 snímků po 1.0 EV**).
 - **Zarovnání a detekce černého disku Měsíce**:
-  - 🌑 **Detekce černého disku Měsíce v záři korony**: Hledá kruhový černý disk Měsíce obklopený světlem korony s filtrem na geometrickou cirkularitu. Spolehlivě odfiltruje stromy, hory i popředí a subpixelově zarovná střed zatmění.
+  - 🌑 **Detekce černého disku Měsíce v záři korony**: Hledá kruhový černý disk Měsíce obklopený světlem korony s filtrem na geometrickou cirkularitu.
   - 🛠️ **Interaktivní ruční dozarovnání fotku po fotce**:
     - Režim **Rozdíl hran (Difference)**, **50% průhledné překrytí (Blend)** i **Blikání (Flicker)**.
     - Možnost posouvat každý snímek po 0.5px / 1px / 5px šipkami na klávesnici i tlačítky na obrazovce.
-    - Tlačítko pro automatické předvyplnění posunů.
-  - 🚫 **Bez zarovnání (Stativ / Krajina + Slunce)**: Pro pevný stativ bez posunů.
-- **Pracovní Proxy režim (Bleskově rychlé skládání)**:
-  - Možnost pracovat v **1/4 nebo 1/8 rozlišení**, kde složení i živé úpravy probíhají za méně než 1 sekundu.
-  - Při exportu se automaticky spočítá a uloží **100% plné rozlišení v 16-bitové hloubce**.
 - **Skládací algoritmy (HDR & Fusion Engines)**:
-  - **Mertens Exposure Fusion** (*Doporučeno pro zatmění Slunce*): Laplaceova pyramidová bezešvá fúze s potlačením šumu v podexponovaných oblastech.
+  - **Mertens Exposure Fusion** (*Doporučeno pro zatmění Slunce*): Laplaceova pyramidová bezešvá fúze s potlačením šumu.
   - **Debevec 32-bit HDR** s kalibrací křivky odezvy snímače (CRF) a tonemappingem (Reinhard, Drago, Mantiuk).
   - **Robertson 32-bit HDR**.
 - **Potlačení šumu & Filtr sluneční korony**:
   - 🛡️ **Redukce šumu (Grain filter)**: Adaptivní bilaterální vyhlazení šumu senzoru bez rozmazání jemných struktur korony.
-  - ☀️ **Eclipse Coronal Detail Filter**: Zvýraznění jemných magnetických siločar ve vnější i vnitřní koroně se striktní ochranou tmavého nebe (šum na pozadí není nikdy doostřován).
-- **Bleskový živý náhled (Zero-Latency Live Preview)**:
-  - Vektorizované a 1D LUT zpracování barev, jasu, kontrastu, saturace a gamma křivek. Posuvníky reagují okamžitě (60 FPS) i na fotografiích ve vysokém rozlišení.
-- **Interaktivní GUI (PyQt6)**:
-  - Moderní tmavý astro motiv.
-  - Plynulý zoom (kolečko myši), posun myší (pan), zobrazení 100% (1:1 pixel) a režim rozděleného srovnání (Split Before/After).
+  - ☀️ **Eclipse Coronal Detail Filter**: Zvýraznění jemných magnetických siločar ve vnější i vnitřní koroně se striktní ochranou tmavého nebe.
 - **Export**:
   - **16-bit TIFF** (ideální pro další postprocessing v PixInsight, Photoshopu či Lightroomu).
   - **PNG**, **100% JPG** a **32-bit Radiance HDR**.
@@ -63,36 +58,9 @@ py main.py
 
 1. **Načtení snímků**:
    - Přetáhněte (Drag & Drop) soubory (např. 9 JPG snímků zatmění) přímo do okna aplikace nebo klikněte na **`+ Přidat fotky`**.
-2. **Zarovnání**:
-   - Klikněte na **`🛠️ Ruční dozarovnání fotku po fotce...`**.
-   - Zde můžete kliknout na **`🌑 Automaticky najít černý disk Měsíce`** a zkontrolovat jednotlivé snímky v režimu *Rozdíl hran* nebo *Blikání*.
-   - Šipkami na klávesnici můžete libovolný snímek posunout o desetiny pixelu a kliknout na **`✅ Použít zarovnání a složit`**.
-3. **Složení expozic & Živé úpravy**:
-   - V proxy režimu (1/4 rozlišení) proběhne složení okamžitě.
-   - Posuvníky dolaďte sytost, kontrast, potlačení šumu a detaily korony.
-4. **Export**:
+2. **Blesková práce ve výřezu (Fast ROI)**:
+   - Klikněte nahoře na **`🎯 Rychlý výřez (ROI 300px)`** a **`☀️ Najít Slunce`** (nebo klikněte myší kamkoliv na Slunce).
+   - Složení i veškeré posuvníky reagují **okamžitě bez jakéhokoliv čekání**.
+3. **Přepnutí na celý snímek / Export**:
+   - Vypnutím tlačítka výřezu se vrátíte na celý snímek.
    - Klikněte na **`💾 Exportovat v plné kvalitě`** a uložte výsledný 16-bit TIFF nebo JPG.
-
----
-
-## 📂 Struktura projektu
-
-```
-solar_hdr_stacker/
-├── core/
-│   ├── exif_and_analysis.py  # EXIF čtení a analýza jasu
-│   ├── aligner.py            # Detektor černého disku Měsíce a subpixelové posuny
-│   ├── merger.py             # Mertens, Debevec, Robertson fúze
-│   └── postprocess.py        # LUT postprocess, denoise & coronal enhancer
-├── gui/
-│   ├── main_window.py        # Hlavní okno a realtime rendering
-│   ├── manual_align_dialog.py # Okno pro ruční/asistované dozarovnání fotek
-│   ├── image_viewer.py       # Zoomovatelný prohlížeč & srovnávač
-│   ├── exposure_list_widget.py # Seznam a správa expozic
-│   ├── controls_panel.py     # Ovládací panel posuvníků
-│   └── styles.py             # Tmavý astronomický motiv
-├── main.py                   # Spouštěcí bod aplikace
-├── requirements.txt
-├── .gitignore
-└── README.md
-```

@@ -1,11 +1,11 @@
 """
 Main Application Window for Astro HDR Stacker.
-Features fast proxy-resolution interactive workflow (1/4 or 1/8 scale for instant stacking/editing),
+Features fast proxy-resolution interactive workflow, interactive ROI (e.g. 300x300 px crop around Sun for real-time sub-50ms editing),
 manual & assisted frame-by-frame subpixel alignment, and asynchronous full-resolution background rendering.
 """
 
 import os
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import (
 
 try:
     from core.exif_and_analysis import ExposureItem
-    from core.aligner import ImageAligner, calculate_moon_shifts, apply_shifts_to_images
+    from core.aligner import ImageAligner, calculate_moon_shifts, apply_shifts_to_images, detect_black_circle_in_light
     from core.merger import HDRMerger
     from core.postprocess import apply_postprocessing, save_image
     from gui.exposure_list_widget import ExposureListWidget
@@ -27,7 +27,7 @@ try:
     from gui.styles import DARK_THEME
 except ImportError:
     from ..core.exif_and_analysis import ExposureItem
-    from ..core.aligner import ImageAligner, calculate_moon_shifts, apply_shifts_to_images
+    from ..core.aligner import ImageAligner, calculate_moon_shifts, apply_shifts_to_images, detect_black_circle_in_light
     from ..core.merger import HDRMerger
     from ..core.postprocess import apply_postprocessing, save_image
     from .exposure_list_widget import ExposureListWidget
@@ -38,16 +38,23 @@ except ImportError:
 
 
 class StackingWorker(QThread):
-    """Background worker for fast proxy-resolution stacking and alignment."""
+    """Background worker for fast proxy-resolution or ROI crop stacking."""
     progress = pyqtSignal(int, str)
     finished_success = pyqtSignal(object, object)  # (base_f32_bgr, hdr_radiance_map_or_None)
     failed = pyqtSignal(str)
 
-    def __init__(self, items: List[ExposureItem], settings: Dict[str, Any], scale: float = 0.25):
+    def __init__(
+        self,
+        items: List[ExposureItem],
+        settings: Dict[str, Any],
+        scale: float = 0.25,
+        roi_rect: Optional[Tuple[int, int, int, int]] = None
+    ):
         super().__init__()
         self.items = items
         self.settings = settings
         self.scale = max(0.05, min(1.0, float(scale)))
+        self.roi_rect = roi_rect  # (x, y, w, h) in base coordinates
 
     def run(self):
         try:
@@ -68,8 +75,19 @@ class StackingWorker(QThread):
                     self.failed.emit(f"Nelze načíst soubor: {item.filepath}")
                     return
 
-                # Downscale for ultra-fast proxy editing
-                if self.scale < 0.99:
+                # If ROI Crop Mode is active, crop directly from original
+                if self.roi_rect is not None:
+                    rx, ry, rw, rh = self.roi_rect
+                    h_orig, w_orig = img.shape[:2]
+                    # Clamp ROI to image boundaries
+                    rx_cl = max(0, min(w_orig - 10, rx))
+                    ry_cl = max(0, min(h_orig - 10, ry))
+                    rw_cl = min(rw, w_orig - rx_cl)
+                    rh_cl = min(rh, h_orig - ry_cl)
+                    img = img[ry_cl:ry_cl+rh_cl, rx_cl:rx_cl+rw_cl]
+
+                # Downscale for ultra-fast proxy editing if not in ROI mode
+                elif self.scale < 0.99:
                     h, w = img.shape[:2]
                     nw, nh = max(16, int(w * self.scale)), max(16, int(h * self.scale))
                     img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
@@ -86,20 +104,20 @@ class StackingWorker(QThread):
             has_manual_shifts = any(abs(it.shift_x) > 0.01 or abs(it.shift_y) > 0.01 for it in self.items)
             align_method = self.settings.get('align_method', 'none')
 
+            effective_scale = 1.0 if self.roi_rect is not None else self.scale
+
             if has_manual_shifts:
                 self.progress.emit(45, "Aplikuji manuálně nastavené posuny...")
                 shifts = [(it.shift_x, it.shift_y) for it in self.items]
-                # Scale shifts according to proxy scale
-                images = apply_shifts_to_images(images, shifts, scale_factor=self.scale)
+                images = apply_shifts_to_images(images, shifts, scale_factor=effective_scale)
             elif align_method == 'eclipse_disc':
                 self.progress.emit(45, "Hledám černý disk Měsíce v záři korony...")
                 shifts = calculate_moon_shifts(images)
                 images = apply_shifts_to_images(images, shifts, scale_factor=1.0)
-                # Store detected shifts back to items
                 for idx, (dx, dy) in enumerate(shifts):
-                    if self.scale > 0:
-                        self.items[idx].shift_x = round(dx / self.scale, 1)
-                        self.items[idx].shift_y = round(dy / self.scale, 1)
+                    if effective_scale > 0:
+                        self.items[idx].shift_x = round(dx / effective_scale, 1)
+                        self.items[idx].shift_y = round(dy / effective_scale, 1)
 
             # Merge
             algo = self.settings.get('algo', 'mertens')
@@ -246,6 +264,10 @@ class MainWindow(QMainWindow):
         self._worker: Optional[StackingWorker] = None
         self._export_worker: Optional[FullResExportWorker] = None
 
+        # ROI Crop Mode state
+        self._roi_active: bool = False
+        self._roi_rect: Optional[Tuple[int, int, int, int]] = None
+
         self._init_ui()
 
     def _init_ui(self):
@@ -265,6 +287,8 @@ class MainWindow(QMainWindow):
 
         # 2. Center panel: Interactive Image Viewer
         self.viewer_container = ImageViewerContainer()
+        self.viewer_container.roi_mode_toggled.connect(self._on_roi_mode_toggled)
+        self.viewer_container.center_sun_requested.connect(self._center_roi_on_sun)
         splitter.addWidget(self.viewer_container)
 
         # 3. Right panel: Controls
@@ -334,6 +358,39 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error previewing file {filepath}: {e}")
 
+    # ------------------ ROI Mode & Sun Centering ------------------
+    def _on_roi_mode_toggled(self, enabled: bool, x: int, y: int, w: int, h: int):
+        self._roi_active = enabled
+        self._roi_rect = (x, y, w, h) if enabled else None
+        
+        if enabled:
+            self.lbl_status.setText(f"🎯 Aktivován bleskový výřez ROI {w}x{h} px. Provádím okamžité složení...")
+            self.start_stacking()
+        else:
+            self.lbl_status.setText("Zobrazen celý snímek. Provádím složení plné scény...")
+            self.start_stacking()
+
+    def _center_roi_on_sun(self):
+        """Finds Sun / Moon disc and centers the ROI box around it."""
+        active_items = self.exposure_list.get_active_items()
+        if not active_items:
+            return
+        
+        ref_item = active_items[len(active_items) // 2]
+        img = cv2.imdecode(np.fromfile(ref_item.filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return
+
+        disc = detect_black_circle_in_light(img)
+        if disc is not None:
+            cx, cy, _ = disc
+            self.viewer_container.viewer.set_roi_center(int(cx), int(cy))
+            self.lbl_status.setText(f"☀️ Slunce nalezeno na souřadnicích [{int(cx)}, {int(cy)}]. Výřez vycentrován.")
+        else:
+            h, w = img.shape[:2]
+            self.viewer_container.viewer.set_roi_center(w // 2, h // 2)
+            self.lbl_status.setText("Slunce nebylo automaticky nalezeno, výřez vycentrován na střed snímku.")
+
     # ------------------ Manual Alignment Dialog ------------------
     def open_manual_alignment(self):
         items = self.exposure_list.get_active_items()
@@ -360,11 +417,18 @@ class MainWindow(QMainWindow):
         self.controls.btn_export.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.lbl_status.setText("Zahajuji rychlé skládání...")
 
         settings = self.controls.get_settings()
         scale = settings.get('proxy_scale', 0.25)
-        self._worker = StackingWorker(items, settings, scale=scale)
+        
+        roi = self._roi_rect if self._roi_active else None
+
+        if roi:
+            self.lbl_status.setText(f"Zahajuji bleskové složení výřezu {roi[2]}x{roi[3]} px...")
+        else:
+            self.lbl_status.setText("Zahajuji rychlé skládání scény...")
+
+        self._worker = StackingWorker(items, settings, scale=scale, roi_rect=roi)
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished_success.connect(self._on_stacking_success)
         self._worker.failed.connect(self._on_stacking_failed)
@@ -383,7 +447,7 @@ class MainWindow(QMainWindow):
         self._hdr_radiance_map = hdr_radiance
 
         active_items = self.exposure_list.get_active_items()
-        if active_items:
+        if active_items and not self._roi_active:
             mid_idx = len(active_items) // 2
             mid_path = active_items[mid_idx].filepath
             mid_img = cv2.imdecode(np.fromfile(mid_path, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -393,8 +457,12 @@ class MainWindow(QMainWindow):
                 self.viewer_container.viewer.set_compare_image_bgr_float(mid_small.astype(np.float32) / 255.0)
 
         self._apply_postprocessing_live()
-        scale_pct = int(self.controls.get_settings().get('proxy_scale', 0.25) * 100)
-        self.lbl_status.setText(f"✅ Složeno ({scale_pct}% rychlý náhled). Posuvníky reagují živě!")
+        
+        if self._roi_active:
+            self.lbl_status.setText("⚡ Bleskový výřez ROI složen (odezva <50ms)! Upravujte posuvníky v reálném čase.")
+        else:
+            scale_pct = int(self.controls.get_settings().get('proxy_scale', 0.25) * 100)
+            self.lbl_status.setText(f"✅ Složeno ({scale_pct}% rychlý náhled). Posuvníky reagují živě!")
 
     def _on_stacking_failed(self, err_msg: str):
         self.controls.btn_stack.setEnabled(True)

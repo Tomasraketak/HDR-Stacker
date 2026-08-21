@@ -1,21 +1,29 @@
 """
-Interactive High-Performance Image Viewer Widget with Zoom, Pan, Pixel Inspector and Split Preview.
+Interactive High-Performance Image Viewer Widget with Zoom, Pan, Pixel Inspector, Split Preview,
+and Interactive ROI (Region of Interest) Selection.
 """
 
-from typing import Optional
+from typing import Optional, Tuple
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QWheelEvent, QMouseEvent, QPen, QColor, QFont, QResizeEvent, QShowEvent
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider, QSizePolicy
+from PyQt6.QtCore import Qt, QRectF, QRect, QPointF, QPoint, pyqtSignal
+from PyQt6.QtGui import (
+    QImage, QPixmap, QPainter, QWheelEvent, QMouseEvent,
+    QPen, QColor, QFont, QResizeEvent, QShowEvent, QBrush
+)
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QSlider, QComboBox, QSizePolicy, QButtonGroup, QRadioButton
+)
 
 
 class InteractiveImageViewer(QWidget):
     """
     Custom widget providing smooth panning, zooming, 1:1 view, fit-to-view,
-    and live pixel information.
+    live pixel information, and interactive ROI crop box selection.
     """
     pixel_hovered = pyqtSignal(int, int, int, int, int)  # x, y, r, g, b
+    roi_selected = pyqtSignal(int, int, int, int)         # x, y, w, h in full-res coordinates
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -35,9 +43,46 @@ class InteractiveImageViewer(QWidget):
         self._compare_pixmap: Optional[QPixmap] = None
         self._compare_split: float = 0.5
 
+        # Interactive ROI Mode
+        self._roi_enabled: bool = False
+        self._roi_rect: Optional[QRect] = None  # in image pixel coordinates (x, y, w, h)
+        self._roi_size: int = 300               # default 300x300 px
+        self._is_roi_dragging: bool = False
+        self._roi_drag_start: Optional[QPoint] = None
+
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def set_roi_enabled(self, enabled: bool):
+        self._roi_enabled = enabled
+        self.update()
+
+    def set_roi_size(self, size: int):
+        self._roi_size = size
+        if self._roi_rect is not None and self._image_rgb is not None:
+            cx = self._roi_rect.center().x()
+            cy = self._roi_rect.center().y()
+            self.set_roi_center(cx, cy)
+
+    def set_roi_center(self, cx: int, cy: int):
+        """Centers the ROI box on (cx, cy) in image coordinates."""
+        if self._image_rgb is None:
+            return
+        h, w = self._image_rgb.shape[:2]
+        half = self._roi_size // 2
+        x0 = max(0, min(w - self._roi_size, cx - half))
+        y0 = max(0, min(h - self._roi_size, cy - half))
+        rw = min(self._roi_size, w)
+        rh = min(self._roi_size, h)
+        self._roi_rect = QRect(int(x0), int(y0), int(rw), int(rh))
+        self.update()
+        self.roi_selected.emit(int(x0), int(y0), int(rw), int(rh))
+
+    def get_roi_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        if self._roi_rect is not None:
+            return (self._roi_rect.x(), self._roi_rect.y(), self._roi_rect.width(), self._roi_rect.height())
+        return None
 
     def set_image_bgr_float(self, img_bgr_f32: np.ndarray):
         """Sets preview image from float32 BGR [0.0, 1.0]."""
@@ -51,9 +96,12 @@ class InteractiveImageViewer(QWidget):
         h, w, ch = self._image_rgb.shape
         bytes_per_line = ch * w
         
-        # Explicit copy ensures Qt manages lifetime safely
         qimg = QImage(self._image_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
         self._pixmap = QPixmap.fromImage(qimg)
+
+        # Initialize default ROI at center if none
+        if self._roi_rect is None and w > 50 and h > 50:
+            self.set_roi_center(w // 2, h // 2)
 
         if not keep_view or self._needs_fit:
             self.fit_to_window()
@@ -133,7 +181,7 @@ class InteractiveImageViewer(QWidget):
         if self._pixmap is None or self._pixmap.isNull():
             painter.setPen(QColor("#555e70"))
             painter.setFont(QFont("Segoe UI", 13))
-            text = "Náhled není k dispozici"
+            text = "Náhled není k dispozici (přetáhněte sem fotky nebo klikněte na '+ Přidat fotky')"
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, text)
             return
 
@@ -164,6 +212,42 @@ class InteractiveImageViewer(QWidget):
             painter.drawText(int(dest_rect.left() + 10), int(dest_rect.top() + 25), "HDR VÝSLEDEK")
             painter.drawText(int(split_x + 10), int(dest_rect.top() + 25), "ORIGINÁL")
 
+        # Draw Interactive ROI Box if enabled
+        if self._roi_enabled and self._roi_rect is not None and self._zoom > 0:
+            rx = dest_rect.left() + self._roi_rect.x() * self._zoom
+            ry = dest_rect.top() + self._roi_rect.y() * self._zoom
+            rw = self._roi_rect.width() * self._zoom
+            rh = self._roi_rect.height() * self._zoom
+            screen_roi = QRectF(rx, ry, rw, rh)
+
+            # Darken outside area slightly
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 100))
+            
+            # 4 surrounding rects
+            painter.drawRect(QRectF(dest_rect.left(), dest_rect.top(), iw, screen_roi.top() - dest_rect.top()))
+            painter.drawRect(QRectF(dest_rect.left(), screen_roi.bottom(), iw, dest_rect.bottom() - screen_roi.bottom()))
+            painter.drawRect(QRectF(dest_rect.left(), screen_roi.top(), screen_roi.left() - dest_rect.left(), screen_roi.height()))
+            painter.drawRect(QRectF(screen_roi.right(), screen_roi.top(), dest_rect.right() - screen_roi.right(), screen_roi.height()))
+            painter.restore()
+
+            # Bounding box glowing stroke
+            pen = QPen(QColor("#00d2ff"), 2, Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(screen_roi)
+
+            # Corner crosshairs
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            center = screen_roi.center()
+            painter.drawLine(int(center.x() - 8), int(center.y()), int(center.x() + 8), int(center.y()))
+            painter.drawLine(int(center.x()), int(center.y() - 8), int(center.x()), int(center.y() + 8))
+
+            # Badge tag
+            painter.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            painter.setPen(QColor("#00d2ff"))
+            painter.drawText(int(rx + 4), int(ry - 6), f"🎯 Výřez pro bleskovou editaci: {self._roi_rect.width()}x{self._roi_rect.height()} px (Klikněte pro přesun)")
+
         painter.setFont(QFont("Segoe UI", 9))
         painter.setPen(QColor("#8c9ba5"))
         zoom_pct = int(self._zoom * 100)
@@ -177,7 +261,7 @@ class InteractiveImageViewer(QWidget):
         old_zoom = self._zoom
         
         factor = 1.15 if event.angleDelta().y() > 0 else (1.0 / 1.15)
-        new_zoom = max(0.02, min(25.0, old_zoom * factor))
+        new_zoom = max(0.02, min(30.0, old_zoom * factor))
         
         if abs(new_zoom - old_zoom) < 1e-6:
             return
@@ -189,6 +273,22 @@ class InteractiveImageViewer(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position()
+            # If ROI mode is active and user clicked inside image, center ROI on click
+            if self._roi_enabled and self._image_rgb is not None and self._zoom > 0:
+                img_x = int((pos.x() - self._pan_pos.x()) / self._zoom)
+                img_y = int((pos.y() - self._pan_pos.y()) / self._zoom)
+                h, w = self._image_rgb.shape[:2]
+                if 0 <= img_x < w and 0 <= img_y < h:
+                    self.set_roi_center(img_x, img_y)
+                    return
+
+            self._is_panning = True
+            self._last_mouse_pos = event.position()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+        elif event.button() == Qt.MouseButton.RightButton:
+            # Right click always pans even in ROI mode
             self._is_panning = True
             self._last_mouse_pos = event.position()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
@@ -210,7 +310,7 @@ class InteractiveImageViewer(QWidget):
                 self.pixel_hovered.emit(img_x, img_y, int(r), int(g), int(b))
 
     def mouseReleaseEvent(self, event: QMouseEvent):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             self._is_panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
@@ -220,8 +320,11 @@ class InteractiveImageViewer(QWidget):
 
 class ImageViewerContainer(QWidget):
     """
-    Encapsulates InteractiveImageViewer with top-right overlay controls (Fit, 100%, Compare).
+    Encapsulates InteractiveImageViewer with top-right overlay controls (Fit, 100%, Compare, ROI Mode).
     """
+    roi_mode_toggled = pyqtSignal(bool, int, int, int, int)  # enabled, x, y, w, h
+    center_sun_requested = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         
@@ -229,6 +332,7 @@ class ImageViewerContainer(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
+        # Top toolbar
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(8, 4, 8, 4)
         
@@ -237,7 +341,31 @@ class ImageViewerContainer(QWidget):
         top_bar.addWidget(self.lbl_info)
         top_bar.addStretch()
 
-        self.btn_fit = QPushButton("Přizpůsobit oknu")
+        # ROI Mode Selector
+        self.btn_roi_toggle = QPushButton("🎯 Rychlý výřez (ROI 300px)")
+        self.btn_roi_toggle.setCheckable(True)
+        self.btn_roi_toggle.setFixedHeight(26)
+        self.btn_roi_toggle.setToolTip("Omezí výpočet a živou editaci pouze na výřez kolem Slunce (např. 300x300 px) pro okamžitou bleskovou odezvu!")
+        self.btn_roi_toggle.toggled.connect(self._on_roi_toggled)
+        top_bar.addWidget(self.btn_roi_toggle)
+
+        self.combo_roi_size = QComboBox()
+        self.combo_roi_size.addItem("300x300 px (Ultra)", 300)
+        self.combo_roi_size.addItem("450x450 px", 450)
+        self.combo_roi_size.addItem("600x600 px", 600)
+        self.combo_roi_size.addItem("800x800 px", 800)
+        self.combo_roi_size.setFixedHeight(26)
+        self.combo_roi_size.setVisible(False)
+        self.combo_roi_size.currentIndexChanged.connect(self._on_roi_size_changed)
+        top_bar.addWidget(self.combo_roi_size)
+
+        self.btn_find_sun = QPushButton("☀️ Najít Slunce")
+        self.btn_find_sun.setFixedHeight(26)
+        self.btn_find_sun.setVisible(False)
+        self.btn_find_sun.clicked.connect(self.center_sun_requested.emit)
+        top_bar.addWidget(self.btn_find_sun)
+
+        self.btn_fit = QPushButton("Přizpůsobit")
         self.btn_fit.setFixedHeight(26)
         self.btn_fit.clicked.connect(self._on_fit)
         top_bar.addWidget(self.btn_fit)
@@ -247,7 +375,7 @@ class ImageViewerContainer(QWidget):
         self.btn_100.clicked.connect(self._on_100)
         top_bar.addWidget(self.btn_100)
 
-        self.btn_split = QPushButton("Srovnání Původní / HDR")
+        self.btn_split = QPushButton("Srovnání")
         self.btn_split.setFixedHeight(26)
         self.btn_split.setCheckable(True)
         self.btn_split.toggled.connect(self._on_split_toggled)
@@ -256,7 +384,7 @@ class ImageViewerContainer(QWidget):
         self.split_slider = QSlider(Qt.Orientation.Horizontal)
         self.split_slider.setRange(0, 100)
         self.split_slider.setValue(50)
-        self.split_slider.setFixedWidth(120)
+        self.split_slider.setFixedWidth(100)
         self.split_slider.setVisible(False)
         self.split_slider.valueChanged.connect(self._on_split_slider)
         top_bar.addWidget(self.split_slider)
@@ -265,6 +393,7 @@ class ImageViewerContainer(QWidget):
 
         self.viewer = InteractiveImageViewer(self)
         self.viewer.pixel_hovered.connect(self._on_pixel_hovered)
+        self.viewer.roi_selected.connect(self._on_viewer_roi_selected)
         layout.addWidget(self.viewer)
 
     def _on_fit(self):
@@ -279,6 +408,31 @@ class ImageViewerContainer(QWidget):
 
     def _on_split_slider(self, val: int):
         self.viewer.set_compare_split(val / 100.0)
+
+    def _on_roi_toggled(self, checked: bool):
+        self.combo_roi_size.setVisible(checked)
+        self.btn_find_sun.setVisible(checked)
+        self.viewer.set_roi_enabled(checked)
+        if checked:
+            self.btn_roi_toggle.setStyleSheet("background-color: #0099ff; color: white; font-weight: bold;")
+        else:
+            self.btn_roi_toggle.setStyleSheet("")
+        rect = self.viewer.get_roi_rect()
+        if rect:
+            self.roi_mode_toggled.emit(checked, rect[0], rect[1], rect[2], rect[3])
+        else:
+            self.roi_mode_toggled.emit(checked, 0, 0, 300, 300)
+
+    def _on_roi_size_changed(self):
+        size = self.combo_roi_size.currentData()
+        self.viewer.set_roi_size(size)
+        rect = self.viewer.get_roi_rect()
+        if rect:
+            self.roi_mode_toggled.emit(self.btn_roi_toggle.isChecked(), rect[0], rect[1], rect[2], rect[3])
+
+    def _on_viewer_roi_selected(self, x: int, y: int, w: int, h: int):
+        if self.btn_roi_toggle.isChecked():
+            self.roi_mode_toggled.emit(True, x, y, w, h)
 
     def _on_pixel_hovered(self, x: int, y: int, r: int, g: int, b: int):
         self.lbl_info.setText(f"Pozice: [{x}, {y}] | RGB: ({r}, {g}, {b})")
