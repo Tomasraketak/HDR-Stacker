@@ -8,7 +8,7 @@ from typing import List, Optional
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QPointF
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont, QKeyEvent
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QFont, QKeyEvent, QShowEvent
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QDoubleSpinBox, QGroupBox, QTableWidget,
@@ -26,6 +26,17 @@ except ImportError:
     from .image_viewer import InteractiveImageViewer
 
 
+def normalize_for_comparison(img_f32_bgr: np.ndarray) -> np.ndarray:
+    """
+    Normalizes exposure so that dark and bright exposures have comparable edge contrast.
+    """
+    gray = cv2.cvtColor((np.clip(img_f32_bgr, 0.0, 1.0) * 255.0).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+    # CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    norm_gray = clahe.apply(gray)
+    return norm_gray.astype(np.float32) / 255.0
+
+
 class ManualAlignDialog(QDialog):
     """
     Interactive dialog for precise manual / assisted frame-by-frame alignment.
@@ -35,15 +46,17 @@ class ManualAlignDialog(QDialog):
     def __init__(self, items: List[ExposureItem], parent=None):
         super().__init__(parent)
         self.setWindowTitle("🛠️ Manuální a asistované zarovnání snímků zatmění")
-        self.resize(1200, 780)
+        self.resize(1240, 800)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.items = items
         self.ref_idx = len(items) // 2
-        self.current_idx = 0
+        # Default to first non-reference frame
+        self.current_idx = 0 if self.ref_idx != 0 else min(1, len(items) - 1)
         
-        # Cache loaded proxy images for fast display
+        # Cache loaded proxy images
         self._cached_images_f32: List[np.ndarray] = []
+        self._norm_grays_f32: List[np.ndarray] = []
         self._load_cached_images()
 
         # Flicker timer
@@ -53,20 +66,21 @@ class ManualAlignDialog(QDialog):
         self._flicker_timer.timeout.connect(self._on_flicker_tick)
 
         self._init_ui()
-        self._update_view()
 
     def _load_cached_images(self):
-        """Loads downscaled proxy images for instant responsive manipulation."""
         self._cached_images_f32 = []
+        self._norm_grays_f32 = []
         for it in self.items:
             img = cv2.imdecode(np.fromfile(it.filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
             if img is None:
-                img = np.zeros((400, 400, 3), dtype=np.uint8)
+                img = np.zeros((600, 600, 3), dtype=np.uint8)
             h, w = img.shape[:2]
             scale = min(1.0, 1600.0 / max(w, h))
             if scale < 0.99:
                 img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-            self._cached_images_f32.append(img.astype(np.float32) / 255.0)
+            f32 = img.astype(np.float32) / 255.0
+            self._cached_images_f32.append(f32)
+            self._norm_grays_f32.append(normalize_for_comparison(f32))
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -89,6 +103,7 @@ class ManualAlignDialog(QDialog):
         for idx, it in enumerate(self.items):
             is_ref = " (REFERENČNÍ BÁZE)" if idx == self.ref_idx else ""
             self.combo_frame.addItem(f"{idx+1}. {it.filename} [{it.shutter_str}]{is_ref}", idx)
+        self.combo_frame.setCurrentIndex(self.current_idx)
         self.combo_frame.currentIndexChanged.connect(self._on_frame_selected)
         nav_layout.addWidget(self.combo_frame)
 
@@ -131,19 +146,21 @@ class ManualAlignDialog(QDialog):
         spin_row = QHBoxLayout()
         spin_row.addWidget(QLabel("Δ X:"))
         self.spin_dx = QDoubleSpinBox()
-        self.spin_dx.setRange(-200.0, 200.0)
+        self.spin_dx.setRange(-300.0, 300.0)
         self.spin_dx.setSingleStep(0.5)
         self.spin_dx.setDecimals(1)
         self.spin_dx.setSuffix(" px")
+        self.spin_dx.setValue(self.items[self.current_idx].shift_x)
         self.spin_dx.valueChanged.connect(self._on_spin_changed)
         spin_row.addWidget(self.spin_dx)
 
         spin_row.addWidget(QLabel("Δ Y:"))
         self.spin_dy = QDoubleSpinBox()
-        self.spin_dy.setRange(-200.0, 200.0)
+        self.spin_dy.setRange(-300.0, 300.0)
         self.spin_dy.setSingleStep(0.5)
         self.spin_dy.setDecimals(1)
         self.spin_dy.setSuffix(" px")
+        self.spin_dy.setValue(self.items[self.current_idx].shift_y)
         self.spin_dy.valueChanged.connect(self._on_spin_changed)
         spin_row.addWidget(self.spin_dy)
         nudge_layout.addLayout(spin_row)
@@ -183,7 +200,7 @@ class ManualAlignDialog(QDialog):
         btn_down.clicked.connect(lambda: self._nudge(0, self.combo_step.currentData()))
         nudge_layout.addWidget(btn_down, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        lbl_hint = QLabel("💡 Tip: Můžete posouvat i přímo klávesovými šipkami (←, →, ↑, ↓)!")
+        lbl_hint = QLabel("💡 Klávesové zkratky: Šipky (←, →, ↑, ↓) na klávesnici posouvají fotku v reálném čase.")
         lbl_hint.setStyleSheet("color: #8c9ba5; font-size: 11px;")
         lbl_hint.setWordWrap(True)
         nudge_layout.addWidget(lbl_hint)
@@ -191,16 +208,16 @@ class ManualAlignDialog(QDialog):
         l_layout.addWidget(nudge_group)
 
         # Automation button: Auto-detect black circle
-        auto_group = QGroupBox("Automatická detekce")
+        auto_group = QGroupBox("Automatická asistence")
         auto_layout = QVBoxLayout(auto_group)
 
-        self.btn_auto_moon = QPushButton("🌑 Automaticky najít černý disk Měsíce")
-        self.btn_auto_moon.setToolTip("Vyhledá kruhový černý disk Měsíce v záři korony na všech snímcích a automaticky vypočte posuny.")
+        self.btn_auto_moon = QPushButton("🌑 Najít černý disk Měsíce")
+        self.btn_auto_moon.setToolTip("Vyhledá kruhový černý disk Měsíce v záři korony a automaticky předvyplní posuny pro všechny snímky.")
         self.btn_auto_moon.setStyleSheet("background-color: #1a73e8; color: white; font-weight: bold;")
         self.btn_auto_moon.clicked.connect(self._auto_detect_moon)
         auto_layout.addWidget(self.btn_auto_moon)
 
-        self.btn_reset_all = QPushButton("Vynulovat všechny posuny")
+        self.btn_reset_all = QPushButton("Vynulovat posuny všech fotek")
         self.btn_reset_all.clicked.connect(self._reset_all_shifts)
         auto_layout.addWidget(self.btn_reset_all)
 
@@ -210,8 +227,32 @@ class ManualAlignDialog(QDialog):
         splitter.addWidget(left_panel)
 
         # 2. Right: Interactive Image Viewer
+        viewer_container = QWidget()
+        v_layout = QVBoxLayout(viewer_container)
+        v_layout.setContentsMargins(0, 0, 0, 0)
+        v_layout.setSpacing(4)
+
+        # Top toolbar for zoom helper
+        top_bar = QHBoxLayout()
+        self.btn_fit = QPushButton("Přizpůsobit oknu")
+        self.btn_fit.clicked.connect(self._fit_view)
+        top_bar.addWidget(self.btn_fit)
+
+        self.btn_100 = QPushButton("100% (1:1)")
+        self.btn_100.clicked.connect(self._zoom_100)
+        top_bar.addWidget(self.btn_100)
+
+        self.btn_zoom_moon = QPushButton("🔍 Přiblížit na Slunce / Měsíc")
+        self.btn_zoom_moon.clicked.connect(self._zoom_on_moon)
+        top_bar.addWidget(self.btn_zoom_moon)
+
+        top_bar.addStretch()
+        v_layout.addLayout(top_bar)
+
         self.viewer = InteractiveImageViewer(self)
-        splitter.addWidget(self.viewer)
+        v_layout.addWidget(self.viewer)
+
+        splitter.addWidget(viewer_container)
 
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 7)
@@ -234,6 +275,37 @@ class ManualAlignDialog(QDialog):
         bottom_row.addWidget(self.btn_apply)
 
         main_layout.addLayout(bottom_row)
+
+    def showEvent(self, event: QShowEvent):
+        super().showEvent(event)
+        QTimer.singleShot(50, self._initial_render)
+
+    def _initial_render(self):
+        self._update_view()
+        self.viewer.fit_to_window()
+
+    def _fit_view(self):
+        self.viewer.fit_to_window()
+
+    def _zoom_100(self):
+        self.viewer.actual_size_100()
+
+    def _zoom_on_moon(self):
+        """Finds moon and centers zoom 300% on it."""
+        if not self._cached_images_f32:
+            return
+        raw = (self._cached_images_f32[self.ref_idx] * 255.0).astype(np.uint8)
+        disc = detect_black_circle_in_light(raw)
+        if disc is not None:
+            cx, cy, _ = disc
+        else:
+            h, w = raw.shape[:2]
+            cx, cy = w / 2.0, h / 2.0
+
+        self.viewer._zoom = 3.0
+        vw, vh = self.viewer.width(), self.viewer.height()
+        self.viewer._pan_pos = QPointF(vw / 2.0 - cx * 3.0, vh / 2.0 - cy * 3.0)
+        self.viewer.update()
 
     def _on_frame_selected(self, idx: int):
         self.current_idx = idx
@@ -289,43 +361,45 @@ class ManualAlignDialog(QDialog):
         self._update_view()
 
     def _update_view(self):
-        """Renders the alignment preview according to selected mode."""
+        """Renders the alignment preview with normalized exposures."""
         if not self._cached_images_f32:
             return
 
         ref_img = self._cached_images_f32[self.ref_idx]
         cur_img = self._cached_images_f32[self.current_idx]
+        ref_norm = self._norm_grays_f32[self.ref_idx]
+        cur_norm = self._norm_grays_f32[self.current_idx]
         it = self.items[self.current_idx]
 
         h, w = cur_img.shape[:2]
         dx, dy = it.shift_x, it.shift_y
 
-        # Shift current image
+        # Shift current image and normalized gray
         if abs(dx) > 0.01 or abs(dy) > 0.01:
             M = np.float32([[1.0, 0.0, dx], [0.0, 1.0, dy]])
             cur_shifted = cv2.warpAffine(cur_img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
+            cur_norm_shifted = cv2.warpAffine(cur_norm, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
         else:
             cur_shifted = cur_img.copy()
+            cur_norm_shifted = cur_norm.copy()
 
         mode = self.bg_modes.checkedId()
 
         if self.current_idx == self.ref_idx:
-            # Viewing reference itself
             self.viewer.set_image_bgr_float(ref_img)
             self.lbl_status.setText("Zobrazen referenční snímek báze.")
             return
 
         if mode == 0:  # Difference
-            # Absolute difference in luminance
-            gray_ref = cv2.cvtColor((ref_img * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
-            gray_cur = cv2.cvtColor((cur_shifted * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
-            diff = np.abs(gray_ref - gray_cur) / 255.0
-            # Highlight edges in high contrast green
+            # Compute edge/gradient differences
+            diff = np.abs(ref_norm - cur_norm_shifted)
+            # Create false-color alignment visualization (green where edges misalign, cyan for reference)
             diff_bgr = np.zeros_like(ref_img)
-            diff_bgr[:, :, 1] = np.clip(diff * 3.0, 0.0, 1.0)
-            diff_bgr[:, :, 2] = np.clip(diff * 1.5, 0.0, 1.0)
+            diff_bgr[:, :, 0] = np.clip(ref_norm * 0.4, 0.0, 1.0)
+            diff_bgr[:, :, 1] = np.clip(diff * 2.5 + cur_norm_shifted * 0.3, 0.0, 1.0)
+            diff_bgr[:, :, 2] = np.clip(diff * 2.0, 0.0, 1.0)
             self.viewer.set_image_bgr_float(diff_bgr)
-            self.lbl_status.setText(f"Snímek {self.current_idx+1}: ΔX={dx:+.1f}px, ΔY={dy:+.1f}px. Minimalizujte zelené hrany.")
+            self.lbl_status.setText(f"Snímek {self.current_idx+1}: ΔX={dx:+.1f}px, ΔY={dy:+.1f}px. Minimalizujte posun hran disku.")
 
         elif mode == 1:  # 50% Blend
             blend = 0.5 * ref_img + 0.5 * cur_shifted
@@ -336,7 +410,7 @@ class ManualAlignDialog(QDialog):
             img_to_show = ref_img if self._flicker_state else cur_shifted
             self.viewer.set_image_bgr_float(img_to_show)
             tag = "REFERENČNÍ" if self._flicker_state else f"SNÍMEK {self.current_idx+1}"
-            self.lbl_status.setText(f"Blikání [{tag}]: Pokud obraz poskakuje, posuňte ΔX a ΔY.")
+            self.lbl_status.setText(f"Blikání [{tag}]: Pokud disk poskakuje, posuňte ΔX a ΔY.")
 
     def _auto_detect_moon(self):
         """Runs automatic black circle detection on all frames and sets shifts."""
@@ -358,7 +432,7 @@ class ManualAlignDialog(QDialog):
         QMessageBox.information(
             self,
             "Automatická detekce dokončena",
-            f"Úspěšně vypočteny posuny pro {len(self.items)} snímků.\nNyní můžete jednotlivé snímky zkontrolovat a doladit."
+            f"Vypočteny posuny pro {len(self.items)} snímků.\nNyní můžete jednotlivé snímky zkontrolovat a doladit."
         )
 
     def _reset_all_shifts(self):

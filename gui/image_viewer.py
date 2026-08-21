@@ -6,8 +6,8 @@ from typing import Optional
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
-from PyQt6.QtGui import QImage, QPixmap, QPainter, QWheelEvent, QMouseEvent, QPen, QColor, QFont
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider, QFrame, QSizePolicy
+from PyQt6.QtGui import QImage, QPixmap, QPainter, QWheelEvent, QMouseEvent, QPen, QColor, QFont, QResizeEvent, QShowEvent
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider, QSizePolicy
 
 
 class InteractiveImageViewer(QWidget):
@@ -20,7 +20,7 @@ class InteractiveImageViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._image_rgb: Optional[np.ndarray] = None  # Full resolution uint8 RGB image
+        self._image_rgb: Optional[np.ndarray] = None
         self._pixmap: Optional[QPixmap] = None
 
         # Transform / view state
@@ -28,11 +28,12 @@ class InteractiveImageViewer(QWidget):
         self._pan_pos: QPointF = QPointF(0, 0)
         self._is_panning: bool = False
         self._last_mouse_pos: QPointF = QPointF(0, 0)
+        self._needs_fit: bool = True
         
         # Split comparison mode (Original vs Result)
         self._compare_mode: bool = False
         self._compare_pixmap: Optional[QPixmap] = None
-        self._compare_split: float = 0.5  # 0.0 to 1.0
+        self._compare_split: float = 0.5
 
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -46,14 +47,15 @@ class InteractiveImageViewer(QWidget):
 
     def set_image_rgb_uint8(self, img_rgb: np.ndarray, keep_view: bool = True):
         """Sets preview image from uint8 RGB array."""
-        self._image_rgb = img_rgb
-        h, w, ch = img_rgb.shape
+        self._image_rgb = img_rgb.copy()
+        h, w, ch = self._image_rgb.shape
         bytes_per_line = ch * w
         
-        qimg = QImage(img_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        # Explicit copy ensures Qt manages lifetime safely
+        qimg = QImage(self._image_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
         self._pixmap = QPixmap.fromImage(qimg)
 
-        if not keep_view or self._zoom == 1.0:
+        if not keep_view or self._needs_fit:
             self.fit_to_window()
         else:
             self.update()
@@ -64,7 +66,7 @@ class InteractiveImageViewer(QWidget):
         rgb = cv2.cvtColor(u8, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
         self._compare_pixmap = QPixmap.fromImage(qimg)
         self.update()
 
@@ -76,6 +78,16 @@ class InteractiveImageViewer(QWidget):
         self._compare_split = max(0.0, min(1.0, split))
         self.update()
 
+    def resizeEvent(self, event: QResizeEvent):
+        super().resizeEvent(event)
+        if self._needs_fit and self._pixmap and not self._pixmap.isNull():
+            self.fit_to_window()
+
+    def showEvent(self, event: QShowEvent):
+        super().showEvent(event)
+        if self._pixmap and not self._pixmap.isNull():
+            self.fit_to_window()
+
     def fit_to_window(self):
         """Fits the image to current widget dimensions."""
         if self._pixmap is None or self._pixmap.isNull():
@@ -84,18 +96,20 @@ class InteractiveImageViewer(QWidget):
         vw, vh = self.width(), self.height()
         iw, ih = self._pixmap.width(), self._pixmap.height()
         
-        if iw == 0 or ih == 0 or vw == 0 or vh == 0:
+        if iw <= 0 or ih <= 0 or vw <= 20 or vh <= 20:
+            self._needs_fit = True
             return
 
-        scale_w = (vw - 20) / iw
-        scale_h = (vh - 20) / ih
-        self._zoom = min(scale_w, scale_h, 1.0)
+        scale_w = (vw - 20) / float(iw)
+        scale_h = (vh - 20) / float(ih)
+        self._zoom = max(0.01, min(scale_w, scale_h, 1.0))
         
         # Center image
         self._pan_pos = QPointF(
             (vw - iw * self._zoom) / 2.0,
             (vh - ih * self._zoom) / 2.0
         )
+        self._needs_fit = False
         self.update()
 
     def actual_size_100(self):
@@ -106,6 +120,7 @@ class InteractiveImageViewer(QWidget):
         iw, ih = self._pixmap.width(), self._pixmap.height()
         self._zoom = 1.0
         self._pan_pos = QPointF((vw - iw) / 2.0, (vh - ih) / 2.0)
+        self._needs_fit = False
         self.update()
 
     def paintEvent(self, event):
@@ -117,8 +132,8 @@ class InteractiveImageViewer(QWidget):
 
         if self._pixmap is None or self._pixmap.isNull():
             painter.setPen(QColor("#555e70"))
-            painter.setFont(QFont("Segoe UI", 14))
-            text = "Přetáhněte sem snímky nebo klikněte na 'Načíst expozice'\n(Podporováno: JPG, PNG, TIFF s různými EV)"
+            painter.setFont(QFont("Segoe UI", 13))
+            text = "Náhled není k dispozici"
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, text)
             return
 
@@ -127,42 +142,34 @@ class InteractiveImageViewer(QWidget):
         dest_rect = QRectF(self._pan_pos.x(), self._pan_pos.y(), iw, ih)
 
         if not self._compare_mode or self._compare_pixmap is None:
-            # Normal single image render
             painter.drawPixmap(dest_rect.toRect(), self._pixmap)
         else:
-            # Split view comparison
             split_x = dest_rect.left() + iw * self._compare_split
 
-            # Left side: Primary merged result
             painter.save()
             painter.setClipRect(QRectF(dest_rect.left(), dest_rect.top(), iw * self._compare_split, ih))
             painter.drawPixmap(dest_rect.toRect(), self._pixmap)
             painter.restore()
 
-            # Right side: Original exposure comparison
             painter.save()
             painter.setClipRect(QRectF(split_x, dest_rect.top(), iw * (1.0 - self._compare_split), ih))
             painter.drawPixmap(dest_rect.toRect(), self._compare_pixmap)
             painter.restore()
 
-            # Divider line
             painter.setPen(QPen(QColor("#4da6ff"), 2))
             painter.drawLine(int(split_x), int(dest_rect.top()), int(split_x), int(dest_rect.bottom()))
 
-            # Badges for Original vs Result
             painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
             painter.setPen(QColor("#ffffff"))
             painter.drawText(int(dest_rect.left() + 10), int(dest_rect.top() + 25), "HDR VÝSLEDEK")
             painter.drawText(int(split_x + 10), int(dest_rect.top() + 25), "ORIGINÁL")
 
-        # Subtle zoom badge in corner
         painter.setFont(QFont("Segoe UI", 9))
         painter.setPen(QColor("#8c9ba5"))
         zoom_pct = int(self._zoom * 100)
-        painter.drawText(10, self.height() - 10, f"Zoom: {zoom_pct}% | Posun: Myší / Kolečko zoom")
+        painter.drawText(10, self.height() - 10, f"Zoom: {zoom_pct}% | Kolečko: Zoom | Myš: Posun")
 
     def wheelEvent(self, event: QWheelEvent):
-        """Zoom in/out towards cursor position."""
         if self._pixmap is None or self._pixmap.isNull():
             return
 
@@ -170,14 +177,14 @@ class InteractiveImageViewer(QWidget):
         old_zoom = self._zoom
         
         factor = 1.15 if event.angleDelta().y() > 0 else (1.0 / 1.15)
-        new_zoom = max(0.02, min(20.0, old_zoom * factor))
+        new_zoom = max(0.02, min(25.0, old_zoom * factor))
         
         if abs(new_zoom - old_zoom) < 1e-6:
             return
 
-        # Keep point under cursor invariant
         self._pan_pos = cursor_pos - (cursor_pos - self._pan_pos) * (new_zoom / old_zoom)
         self._zoom = new_zoom
+        self._needs_fit = False
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent):
@@ -194,7 +201,6 @@ class InteractiveImageViewer(QWidget):
             self._last_mouse_pos = pos
             self.update()
 
-        # Emit pixel under cursor
         if self._image_rgb is not None and self._zoom > 0:
             img_x = int((pos.x() - self._pan_pos.x()) / self._zoom)
             img_y = int((pos.y() - self._pan_pos.y()) / self._zoom)
@@ -209,7 +215,6 @@ class InteractiveImageViewer(QWidget):
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
-        # Double click to fit to window
         self.fit_to_window()
 
 
@@ -224,7 +229,6 @@ class ImageViewerContainer(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        # Top mini-toolbar
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(8, 4, 8, 4)
         
