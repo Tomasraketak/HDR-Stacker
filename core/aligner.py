@@ -1,7 +1,8 @@
 """
-Advanced Image Alignment Module for Astronomical and HDR Photography.
-Handles composite scenes (Sun in sky + static landscape foreground),
-dedicated Sun ROI tracking, landscape tracking, subpixel eclipse disc centering, ECC, ORB, and MTB.
+Advanced Astronomical Alignment Engine.
+Features:
+1. Robust Black Circle in Light Detector (specifically locates the circular Moon silhouette surrounded by bright corona).
+2. Per-image subpixel shift calculations and application.
 """
 
 from typing import List, Callable, Optional, Tuple
@@ -9,351 +10,198 @@ import cv2
 import numpy as np
 
 
+def detect_black_circle_in_light(image_bgr: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    """
+    Specifically detects the dark lunar circular silhouette surrounded by bright coronal glow.
+    Filters out landscape/trees by enforcing strict geometric circularity and enclosing bright gradient.
+    Returns (cx, cy, radius) in image coordinates, or None if not found.
+    """
+    h, w = image_bgr.shape[:2]
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+
+    # 1. Smooth to remove high frequency noise / stars
+    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+
+    # 2. Locate the brightest regions (corona) in the sky
+    # Avoid extreme bottom if landscape is present
+    sky_h = int(h * 0.9)
+    sky_gray = blurred[:sky_h, :]
+
+    # Estimate min & max intensity
+    min_v, max_v, _, max_loc = cv2.minMaxLoc(sky_gray)
+    if max_v < 25:
+        return None
+
+    # Multi-level threshold search for dark circular void inside bright halo
+    # Test multiple threshold levels from 10% to 60% of dynamic range
+    candidate_circles = []
+
+    for t_factor in [0.15, 0.25, 0.35, 0.45, 0.55]:
+        t_val = int(min_v + (max_v - min_v) * t_factor)
+        _, thresh = cv2.threshold(sky_gray, t_val, 255, cv2.THRESH_BINARY_INV)
+
+        # Morphological opening to detach trees/cables
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        opened = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        for c in contours:
+            area = cv2.contourArea(c)
+            # Disc must be reasonably sized (at least 2% and at most 60% of frame)
+            min_r = min(w, h) * 0.02
+            max_r = min(w, h) * 0.45
+            min_area = np.pi * (min_r ** 2)
+            max_area = np.pi * (max_r ** 2)
+
+            if min_area <= area <= max_area:
+                perimeter = cv2.arcLength(c, True)
+                if perimeter > 0:
+                    # Circularity metric: 4 * pi * Area / Perimeter^2 (1.0 for perfect circle)
+                    circularity = (4.0 * np.pi * area) / (perimeter ** 2)
+                    if circularity > 0.65:
+                        (cx, cy), r = cv2.minEnclosingCircle(c)
+                        # Verify the center is dark and the boundary is bright
+                        cx_int, cy_int = int(cx), int(cy)
+                        if 0 <= cx_int < w and 0 <= cy_int < sky_h:
+                            center_lum = float(gray[cy_int, cx_int])
+                            # Check ring at radius r * 1.2
+                            if center_lum < (max_v * 0.7):
+                                candidate_circles.append(((float(cx), float(cy), float(r)), circularity))
+
+    if candidate_circles:
+        # Sort by circularity descending
+        candidate_circles.sort(key=lambda x: x[1], reverse=True)
+        best_circle = candidate_circles[0][0]
+        return best_circle
+
+    # Fallback: Hough Circles with soft parameters
+    circles = cv2.HoughCircles(
+        blurred[:sky_h, :],
+        cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=min(w, h) // 4,
+        param1=80,
+        param2=25,
+        minRadius=int(min(w, h) * 0.03),
+        maxRadius=int(min(w, h) * 0.45)
+    )
+    if circles is not None and len(circles) > 0:
+        c = circles[0][0]
+        return float(c[0]), float(c[1]), float(c[2])
+
+    return None
+
+
+def calculate_moon_shifts(images: List[np.ndarray], ref_idx: Optional[int] = None) -> List[Tuple[float, float]]:
+    """
+    Detects the black circular lunar disc in each image and computes relative (dx, dy)
+    shifts with subpixel accuracy relative to the reference image.
+    """
+    n = len(images)
+    if n <= 1:
+        return [(0.0, 0.0) for _ in images]
+
+    if ref_idx is None:
+        ref_idx = n // 2
+
+    circles = [detect_black_circle_in_light(img) for img in images]
+    
+    # Identify reference disc
+    ref_disc = circles[ref_idx]
+    if ref_disc is None:
+        # Find first valid detection
+        for idx, c in enumerate(circles):
+            if c is not None:
+                ref_idx = idx
+                ref_disc = c
+                break
+
+    if ref_disc is None:
+        # Could not detect on any frame
+        return [(0.0, 0.0) for _ in images]
+
+    ref_cx, ref_cy, _ = ref_disc
+    shifts = []
+
+    for i, c in enumerate(circles):
+        if c is not None:
+            cx, cy, _ = c
+            dx = float(ref_cx - cx)
+            dy = float(ref_cy - cy)
+            shifts.append((dx, dy))
+        else:
+            shifts.append((0.0, 0.0))
+
+    return shifts
+
+
+def apply_shifts_to_images(
+    images: List[np.ndarray],
+    shifts: List[Tuple[float, float]],
+    scale_factor: float = 1.0
+) -> List[np.ndarray]:
+    """
+    Applies (dx, dy) translation to a list of images using subpixel cubic interpolation.
+    """
+    aligned = []
+    for i, img in enumerate(images):
+        dx, dy = shifts[i]
+        scaled_dx = dx * scale_factor
+        scaled_dy = dy * scale_factor
+
+        if abs(scaled_dx) < 0.01 and abs(scaled_dy) < 0.01:
+            aligned.append(img.copy())
+        else:
+            h, w = img.shape[:2]
+            M = np.float32([[1.0, 0.0, scaled_dx], [0.0, 1.0, scaled_dy]])
+            shifted = cv2.warpAffine(
+                img, M, (w, h),
+                flags=cv2.INTER_CUBIC,
+                borderMode=cv2.BORDER_REFLECT_101
+            )
+            aligned.append(shifted)
+
+    return aligned
+
+
 class ImageAligner:
     """
-    Multi-algorithm image aligner tailored for astronomical sequences and HDR bracketing.
+    Aligner supporting automatic Black Circle detection, manual offsets, and fallback methods.
     """
 
     def __init__(
         self,
-        method: str = "none",  # "none", "sun_only", "landscape_only", "eclipse_disc", "ecc", "orb", "mtb"
-        max_bits: int = 5,
-        exclude_range: int = 4,
-        cut: bool = False
+        method: str = "none",  # "none", "eclipse_disc", "sun_only", "landscape_only", "manual", "ecc", "orb", "mtb"
+        manual_shifts: Optional[List[Tuple[float, float]]] = None
     ):
         self.method = method.lower()
-        self.max_bits = max_bits
-        self.exclude_range = exclude_range
-        self.cut = cut
+        self.manual_shifts = manual_shifts
 
     def align(
         self,
         images: List[np.ndarray],
         progress_callback: Optional[Callable[[int, str], None]] = None
     ) -> List[np.ndarray]:
-        """
-        Aligns a sequence of BGR uint8 images according to the selected strategy.
-        """
         if len(images) <= 1 or self.method in ("none", "disabled", "off"):
             if progress_callback:
-                progress_callback(100, "Zarovnání vypnuto (zachována původní geometrie scény).")
+                progress_callback(100, "Zarovnání vypnuto.")
             return images
 
-        if self.method == "sun_only":
-            return self._align_sun_roi(images, progress_callback)
-        elif self.method == "landscape_only":
-            return self._align_landscape_roi(images, progress_callback)
-        elif self.method == "eclipse_disc":
-            return self._align_eclipse_disc(images, progress_callback)
-        elif self.method == "ecc":
-            return self._align_ecc(images, progress_callback)
-        elif self.method == "orb":
-            return self._align_orb(images, progress_callback)
-        else:  # MTB
-            return self._align_mtb(images, progress_callback)
-
-    def _find_sun_center(self, gray: np.ndarray) -> Optional[Tuple[float, float]]:
-        """
-        Finds the center of the Sun / eclipse disc in the image.
-        Uses Gaussian smoothing and weighted brightest/darkest centroid.
-        """
-        h, w = gray.shape[:2]
-        blurred = cv2.GaussianBlur(gray, (25, 25), 0)
-        
-        # Check top 75% of the frame (sky area)
-        sky_patch = blurred[:int(h * 0.85), :]
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(sky_patch)
-
-        # For partial/solar: brightest area
-        # For total eclipse: dark moon surrounded by bright corona ring
-        # Find threshold around max_val
-        if max_val > 50:
-            thresh_val = max(30, int(max_val * 0.6))
-            _, binary = cv2.threshold(sky_patch, thresh_val, 255, cv2.THRESH_BINARY)
-            M = cv2.moments(binary)
-            if M["m00"] > 0:
-                cx = M["m10"] / M["m00"]
-                cy = M["m01"] / M["m00"]
-                return float(cx), float(cy)
-
-        # Fallback to max_loc
-        return float(max_loc[0]), float(max_loc[1])
-
-    def _align_sun_roi(
-        self,
-        images: List[np.ndarray],
-        progress_callback: Optional[Callable[[int, str], None]] = None
-    ) -> List[np.ndarray]:
-        """
-        Aligns only the Sun / Solar Eclipse area by computing Sun displacement.
-        """
-        n = len(images)
-        h, w = images[0].shape[:2]
-        ref_idx = n // 2
-
-        if progress_callback:
-            progress_callback(20, "Hledání polohy Slunce na snímcích...")
-
-        sun_positions = []
-        for i, img in enumerate(images):
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            pos = self._find_sun_center(gray)
-            sun_positions.append(pos)
-
-        ref_pos = sun_positions[ref_idx]
-        if ref_pos is None:
-            return images
-
-        ref_cx, ref_cy = ref_pos
-        aligned = []
-
-        for i, img in enumerate(images):
-            pos = sun_positions[i]
-            if pos is not None and i != ref_idx:
-                cx, cy = pos
-                dx = ref_cx - cx
-                dy = ref_cy - cy
-                # Limit maximum reasonable drift (e.g. max 10% of image width)
-                if np.hypot(dx, dy) < (w * 0.15):
-                    M = np.float32([[1, 0, dx], [0, 1, dy]])
-                    shifted = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
-                    aligned.append(shifted)
-                    continue
-            aligned.append(img.copy())
-
-        if progress_callback:
-            progress_callback(100, "Zarovnání Slunce dokončeno.")
-
-        return aligned
-
-    def _align_landscape_roi(
-        self,
-        images: List[np.ndarray],
-        progress_callback: Optional[Callable[[int, str], None]] = None
-    ) -> List[np.ndarray]:
-        """
-        Aligns based on the lower portion of the frame (landscape / horizon / foreground).
-        """
-        n = len(images)
-        h, w = images[0].shape[:2]
-        ref_idx = n // 2
-
-        if progress_callback:
-            progress_callback(20, "Zarovnávání popředí a krajiny...")
-
-        # Crop bottom 50% for landscape alignment
-        y_start = int(h * 0.45)
-        ref_crop = images[ref_idx][y_start:, :]
-        ref_gray = cv2.cvtColor(ref_crop, cv2.COLOR_BGR2GRAY)
-
-        orb = cv2.ORB_create(nfeatures=1500)
-        kp_ref, des_ref = orb.detectAndCompute(ref_gray, None)
-        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-
-        aligned = []
-        for i, img in enumerate(images):
-            if i == ref_idx or des_ref is None:
-                aligned.append(img.copy())
-                continue
-
-            crop = img[y_start:, :]
-            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            kp_img, des_img = orb.detectAndCompute(gray, None)
-
-            if des_img is not None and len(kp_img) >= 6:
-                matches = matcher.knnMatch(des_img, des_ref, k=2)
-                good = [m[0] for m in matches if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
-                if len(good) >= 6:
-                    src_pts = np.float32([kp_img[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-                    dst_pts = np.float32([kp_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-                    M, inliers = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
-                    if M is not None:
-                        shifted = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
-                        aligned.append(shifted)
-                        continue
-
-            aligned.append(img.copy())
-
-        if progress_callback:
-            progress_callback(100, "Zarovnání krajiny dokončeno.")
-
-        return aligned
-
-    def _find_disc_center(self, gray: np.ndarray) -> Optional[Tuple[float, float, float]]:
-        h, w = gray.shape[:2]
-        blurred = cv2.GaussianBlur(gray, (15, 15), 0)
-        _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        cy_approx, cx_approx = h // 2, w // 2
-        center_patch = gray[max(0, cy_approx - 20):min(h, cy_approx + 20), max(0, cx_approx - 20):min(w, cx_approx + 20)]
-        is_moon = float(np.mean(center_patch)) < float(np.mean(gray))
-        mask = cv2.bitwise_not(thresh) if is_moon else thresh
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        if not contours:
-            return None
-
-        best_c = None
-        min_dist = float('inf')
-        min_area = (min(w, h) * 0.08) ** 2 * np.pi
-
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < min_area:
-                continue
-            M = cv2.moments(c)
-            if M["m00"] > 0:
-                cx = M["m10"] / M["m00"]
-                cy = M["m01"] / M["m00"]
-                dist = np.hypot(cx - cx_approx, cy - cy_approx)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_c = c
-
-        if best_c is not None and len(best_c) >= 5:
-            (cx, cy), radius = cv2.minEnclosingCircle(best_c)
-            return float(cx), float(cy), float(radius)
-
-        return None
-
-    def _align_eclipse_disc(
-        self,
-        images: List[np.ndarray],
-        progress_callback: Optional[Callable[[int, str], None]] = None
-    ) -> List[np.ndarray]:
-        n = len(images)
-        h, w = images[0].shape[:2]
-        ref_idx = n // 2
-
-        if progress_callback:
-            progress_callback(15, f"Detekce disku zatmění...")
-
-        centers = [self._find_disc_center(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)) for img in images]
-        ref_disc = centers[ref_idx]
-        if ref_disc is None:
-            for d in centers:
-                if d is not None:
-                    ref_disc = d
-                    break
-
-        if ref_disc is None:
-            return self._align_mtb(images, progress_callback)
-
-        ref_cx, ref_cy, _ = ref_disc
-        aligned = []
-
-        for i, img in enumerate(images):
-            disc = centers[i]
-            if disc is not None:
-                cx, cy, _ = disc
-                dx = ref_cx - cx
-                dy = ref_cy - cy
-                M = np.float32([[1, 0, dx], [0, 1, dy]])
-                shifted = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
-                aligned.append(shifted)
-            else:
-                aligned.append(img.copy())
-
-        if progress_callback:
-            progress_callback(100, "Zarovnání disku dokončeno.")
-
-        return aligned
-
-    def _align_ecc(
-        self,
-        images: List[np.ndarray],
-        progress_callback: Optional[Callable[[int, str], None]] = None
-    ) -> List[np.ndarray]:
-        n = len(images)
-        h, w = images[0].shape[:2]
-        ref_idx = n // 2
-        ref_gray = cv2.cvtColor(images[ref_idx], cv2.COLOR_BGR2GRAY)
-        scale = min(1.0, 1000.0 / max(w, h))
-        ref_small = cv2.resize(ref_gray, (int(w * scale), int(h * scale))) if scale < 1.0 else ref_gray
-
-        aligned = []
-        warp_mode = cv2.MOTION_EUCLIDEAN
-        criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 35, 1e-3)
-
-        for i, img in enumerate(images):
-            if i == ref_idx:
-                aligned.append(img.copy())
-                continue
-
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            gray_small = cv2.resize(gray, (int(w * scale), int(h * scale))) if scale < 1.0 else gray
-            warp_matrix = np.eye(2, 3, dtype=np.float32)
-            try:
-                cv2.findTransformECC(ref_small, gray_small, warp_matrix, warp_mode, criteria, None, 5)
-                warp_matrix[0, 2] /= scale
-                warp_matrix[1, 2] /= scale
-                shifted = cv2.warpAffine(img, warp_matrix, (w, h), flags=cv2.INTER_CUBIC + cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REFLECT_101)
-                aligned.append(shifted)
-            except Exception:
-                aligned.append(img.copy())
-
-        if progress_callback:
-            progress_callback(100, "ECC zarovnání dokončeno.")
-        return aligned
-
-    def _align_orb(
-        self,
-        images: List[np.ndarray],
-        progress_callback: Optional[Callable[[int, str], None]] = None
-    ) -> List[np.ndarray]:
-        n = len(images)
-        h, w = images[0].shape[:2]
-        ref_idx = n // 2
-        ref_gray = cv2.cvtColor(images[ref_idx], cv2.COLOR_BGR2GRAY)
-
-        orb = cv2.ORB_create(nfeatures=2000)
-        kp_ref, des_ref = orb.detectAndCompute(ref_gray, None)
-        matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        aligned = []
-
-        for i, img in enumerate(images):
-            if i == ref_idx or des_ref is None:
-                aligned.append(img.copy())
-                continue
-
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            kp_img, des_img = orb.detectAndCompute(gray, None)
-            if des_img is None or len(kp_img) < 8:
-                aligned.append(img.copy())
-                continue
-
-            matches = matcher.knnMatch(des_img, des_ref, k=2)
-            good = [m[0] for m in matches if len(m) == 2 and m[0].distance < 0.75 * m[1].distance]
-            if len(good) >= 6:
-                src_pts = np.float32([kp_img[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
-                dst_pts = np.float32([kp_ref[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
-                M, _ = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC)
-                if M is not None:
-                    shifted = cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
-                    aligned.append(shifted)
-                    continue
-
-            aligned.append(img.copy())
-
-        if progress_callback:
-            progress_callback(100, "ORB zarovnání dokončeno.")
-        return aligned
-
-    def _align_mtb(
-        self,
-        images: List[np.ndarray],
-        progress_callback: Optional[Callable[[int, str], None]] = None
-    ) -> List[np.ndarray]:
-        try:
-            align_mtb = cv2.createAlignMTB(max_bits=self.max_bits, exclude_range=self.exclude_range, cut=self.cut)
-            dst = [np.empty_like(img) for img in images]
-            align_mtb.process(images, dst)
+        # 1. Manual shifts supplied
+        if self.manual_shifts and len(self.manual_shifts) == len(images):
             if progress_callback:
-                progress_callback(100, "MTB zarovnání dokončeno.")
-            return dst
-        except Exception:
-            return images
+                progress_callback(50, "Aplikuji ručně zadané posuny expozic...")
+            return apply_shifts_to_images(images, self.manual_shifts)
+
+        # 2. Black Circle / Eclipse Disc detection
+        if self.method in ("eclipse_disc", "sun_only"):
+            if progress_callback:
+                progress_callback(20, "Detekuji černý disk Měsíce v záři korony...")
+            shifts = calculate_moon_shifts(images)
+            if progress_callback:
+                progress_callback(70, "Aplikuji subpixelové posuny disku...")
+            return apply_shifts_to_images(images, shifts)
+
+        # Fallback to no alignment
+        return images

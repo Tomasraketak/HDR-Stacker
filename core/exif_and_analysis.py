@@ -25,6 +25,8 @@ class ExposureItem:
     mean_luminance: float = 0.0
     is_valid: bool = True
     thumbnail: Optional[np.ndarray] = None
+    shift_x: float = 0.0
+    shift_y: float = 0.0
 
 
 def format_shutter_speed(sec: float) -> str:

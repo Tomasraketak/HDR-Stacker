@@ -1,7 +1,7 @@
 """
 Main Application Window for Astro HDR Stacker.
-Features fast proxy-resolution interactive workflow (1/4 or 1/8 scale for instant stacking/editing)
-and asynchronous full-resolution background rendering upon export.
+Features fast proxy-resolution interactive workflow (1/4 or 1/8 scale for instant stacking/editing),
+manual & assisted frame-by-frame subpixel alignment, and asynchronous full-resolution background rendering.
 """
 
 import os
@@ -17,21 +17,23 @@ from PyQt6.QtWidgets import (
 
 try:
     from core.exif_and_analysis import ExposureItem
-    from core.aligner import ImageAligner
+    from core.aligner import ImageAligner, calculate_moon_shifts, apply_shifts_to_images
     from core.merger import HDRMerger
     from core.postprocess import apply_postprocessing, save_image
     from gui.exposure_list_widget import ExposureListWidget
     from gui.image_viewer import ImageViewerContainer
     from gui.controls_panel import ControlsPanel
+    from gui.manual_align_dialog import ManualAlignDialog
     from gui.styles import DARK_THEME
 except ImportError:
     from ..core.exif_and_analysis import ExposureItem
-    from ..core.aligner import ImageAligner
+    from ..core.aligner import ImageAligner, calculate_moon_shifts, apply_shifts_to_images
     from ..core.merger import HDRMerger
     from ..core.postprocess import apply_postprocessing, save_image
     from .exposure_list_widget import ExposureListWidget
     from .image_viewer import ImageViewerContainer
     from .controls_panel import ControlsPanel
+    from .manual_align_dialog import ManualAlignDialog
     from .styles import DARK_THEME
 
 
@@ -80,15 +82,24 @@ class StackingWorker(QThread):
                 if img.shape[:2] != (h0, w0):
                     images[i] = cv2.resize(img, (w0, h0), interpolation=cv2.INTER_AREA)
 
-            # Alignment
+            # Alignment Check
+            has_manual_shifts = any(abs(it.shift_x) > 0.01 or abs(it.shift_y) > 0.01 for it in self.items)
             align_method = self.settings.get('align_method', 'none')
-            if align_method != 'none':
-                self.progress.emit(45, f"Zarovnávání ({align_method})...")
-                aligner = ImageAligner(method=align_method, max_bits=4, exclude_range=4, cut=False)
-                images = aligner.align(
-                    images,
-                    progress_callback=lambda p, msg: self.progress.emit(int(45 + p * 0.25), msg)
-                )
+
+            if has_manual_shifts:
+                self.progress.emit(45, "Aplikuji manuálně nastavené posuny...")
+                shifts = [(it.shift_x, it.shift_y) for it in self.items]
+                # Scale shifts according to proxy scale
+                images = apply_shifts_to_images(images, shifts, scale_factor=self.scale)
+            elif align_method == 'eclipse_disc':
+                self.progress.emit(45, "Hledám černý disk Měsíce v záři korony...")
+                shifts = calculate_moon_shifts(images)
+                images = apply_shifts_to_images(images, shifts, scale_factor=1.0)
+                # Store detected shifts back to items
+                for idx, (dx, dy) in enumerate(shifts):
+                    if self.scale > 0:
+                        self.items[idx].shift_x = round(dx / self.scale, 1)
+                        self.items[idx].shift_y = round(dy / self.scale, 1)
 
             # Merge
             algo = self.settings.get('algo', 'mertens')
@@ -158,11 +169,18 @@ class FullResExportWorker(QThread):
                 if img.shape[:2] != (h0, w0):
                     images[i] = cv2.resize(img, (w0, h0), interpolation=cv2.INTER_AREA)
 
+            # Alignment in full resolution
+            has_manual_shifts = any(abs(it.shift_x) > 0.01 or abs(it.shift_y) > 0.01 for it in self.items)
             align_method = self.settings.get('align_method', 'none')
-            if align_method != 'none':
-                self.progress.emit(42, f"Zarovnávání v plném rozlišení ({align_method})...")
-                aligner = ImageAligner(method=align_method, max_bits=5, exclude_range=4, cut=False)
-                images = aligner.align(images, progress_callback=lambda p, msg: self.progress.emit(int(42 + p * 0.25), msg))
+
+            if has_manual_shifts:
+                self.progress.emit(42, "Aplikuji posuny v plném rozlišení...")
+                shifts = [(it.shift_x, it.shift_y) for it in self.items]
+                images = apply_shifts_to_images(images, shifts, scale_factor=1.0)
+            elif align_method == 'eclipse_disc':
+                self.progress.emit(42, "Zarovnávám disk Měsíce v plném rozlišení...")
+                shifts = calculate_moon_shifts(images)
+                images = apply_shifts_to_images(images, shifts, scale_factor=1.0)
 
             algo = self.settings.get('algo', 'mertens')
             hdr_radiance = None
@@ -253,6 +271,7 @@ class MainWindow(QMainWindow):
         self.controls = ControlsPanel()
         self.controls.setMinimumWidth(320)
         self.controls.stack_requested.connect(self.start_stacking)
+        self.controls.manual_align_requested.connect(self.open_manual_alignment)
         self.controls.live_adjust_requested.connect(self._apply_postprocessing_live)
         self.controls.export_requested.connect(self.export_result)
         splitter.addWidget(self.controls)
@@ -315,6 +334,17 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error previewing file {filepath}: {e}")
 
+    # ------------------ Manual Alignment Dialog ------------------
+    def open_manual_alignment(self):
+        items = self.exposure_list.get_active_items()
+        if len(items) < 2:
+            QMessageBox.warning(self, "Nedostatek snímků", "Pro zarovnání načtěte alespoň 2 aktivní snímky.")
+            return
+
+        dialog = ManualAlignDialog(items, parent=self)
+        dialog.shifts_applied.connect(self.start_stacking)
+        dialog.exec()
+
     # ------------------ Stacking Execution ------------------
     def start_stacking(self):
         items = self.exposure_list.get_active_items()
@@ -364,7 +394,7 @@ class MainWindow(QMainWindow):
 
         self._apply_postprocessing_live()
         scale_pct = int(self.controls.get_settings().get('proxy_scale', 0.25) * 100)
-        self.lbl_status.setText(f"✅ Složeno ({scale_pct}% rychlý náhled). Posuvníky reagují živě! Při exportu se spočítá 100% plná kvalita.")
+        self.lbl_status.setText(f"✅ Složeno ({scale_pct}% rychlý náhled). Posuvníky reagují živě!")
 
     def _on_stacking_failed(self, err_msg: str):
         self.controls.btn_stack.setEnabled(True)

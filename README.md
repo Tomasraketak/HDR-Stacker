@@ -10,12 +10,16 @@ Profesionální desktopová aplikace v Pythonu (PyQt6 + OpenCV) pro skládání 
   - Automatické vyčtení expozičních časů, ISO a clony z **EXIF** metadat.
   - Inteligentní analýza jasu scény: Pokud EXIF chybí, aplikace analyzuje histogram a seřadí snímky od nejkratší expozice (-EV) po nejdelší (+EV).
   - Možnost definovat krok (např. **9 snímků po 1.0 EV**).
-- **Pokročilé metody zarovnání (Multi-Algorithm Alignment)**:
-  - 🌑 **Astronomické zarovnání disku zatmění (Subpixel Eclipse Disc)**: Detekuje subpixelový střed siluety Měsíce/Slunce. Ideální pro zatmění Slunce, kde se jas jednotlivých expozic liší o několik řádů.
-  - ⚡ **ECC (Enhanced Correlation Coefficient)**: Subpixelová afinní/euklidovská optimalizace posunu a rotace.
-  - 🔍 **ORB & RANSAC**: Detekce klíčových bodů s robustním filtrováním.
-  - 📐 **MTB (Median Threshold Bitmap)**: Klasické prahové zarovnání.
-  - 🚫 **Bez zarovnání**: Pro snímky pořízené na přesné paralaktické montáži.
+- **Zarovnání a detekce černého disku Měsíce**:
+  - 🌑 **Detekce černého disku Měsíce v záři korony**: Hledá kruhový černý disk Měsíce obklopený světlem korony s filtrem na geometrickou cirkularitu. Spolehlivě odfiltruje stromy, hory i popředí a subpixelově zarovná střed zatmění.
+  - 🛠️ **Interaktivní ruční dozarovnání fotku po fotce**:
+    - Režim **Rozdíl hran (Difference)**, **50% průhledné překrytí (Blend)** i **Blikání (Flicker)**.
+    - Možnost posouvat každý snímek po 0.5px / 1px / 5px šipkami na klávesnici i tlačítky na obrazovce.
+    - Tlačítko pro automatické předvyplnění posunů.
+  - 🚫 **Bez zarovnání (Stativ / Krajina + Slunce)**: Pro pevný stativ bez posunů.
+- **Pracovní Proxy režim (Bleskově rychlé skládání)**:
+  - Možnost pracovat v **1/4 nebo 1/8 rozlišení**, kde složení i živé úpravy probíhají za méně než 1 sekundu.
+  - Při exportu se automaticky spočítá a uloží **100% plné rozlišení v 16-bitové hloubce**.
 - **Skládací algoritmy (HDR & Fusion Engines)**:
   - **Mertens Exposure Fusion** (*Doporučeno pro zatmění Slunce*): Laplaceova pyramidová bezešvá fúze s potlačením šumu v podexponovaných oblastech.
   - **Debevec 32-bit HDR** s kalibrací křivky odezvy snímače (CRF) a tonemappingem (Reinhard, Drago, Mantiuk).
@@ -59,15 +63,15 @@ py main.py
 
 1. **Načtení snímků**:
    - Přetáhněte (Drag & Drop) soubory (např. 9 JPG snímků zatmění) přímo do okna aplikace nebo klikněte na **`+ Přidat fotky`**.
-2. **Kontrola / nastavení EV a zarovnání**:
-   - Aplikace automaticky seřadí snímky a přiřadí jim EV.
-   - Vyberte metodu zarovnání (výchozí: **Zatmění - subpixel střed**).
-3. **Složení expozic**:
-   - Klikněte na **`⚡ Složit snímky (HDR Merge)`**.
-4. **Okamžité doladění detailů a barev**:
-   - Upravte sytost, kontrast, jas, redukci šumu a zvýraznění korony posuvníky vpravo s okamžitou odezvou.
-5. **Export**:
-   - Klikněte na **`💾 Exportovat výsledek`** a uložte výsledný snímek jako 16-bit TIFF nebo JPG.
+2. **Zarovnání**:
+   - Klikněte na **`🛠️ Ruční dozarovnání fotku po fotce...`**.
+   - Zde můžete kliknout na **`🌑 Automaticky najít černý disk Měsíce`** a zkontrolovat jednotlivé snímky v režimu *Rozdíl hran* nebo *Blikání*.
+   - Šipkami na klávesnici můžete libovolný snímek posunout o desetiny pixelu a kliknout na **`✅ Použít zarovnání a složit`**.
+3. **Složení expozic & Živé úpravy**:
+   - V proxy režimu (1/4 rozlišení) proběhne složení okamžitě.
+   - Posuvníky dolaďte sytost, kontrast, potlačení šumu a detaily korony.
+4. **Export**:
+   - Klikněte na **`💾 Exportovat v plné kvalitě`** a uložte výsledný 16-bit TIFF nebo JPG.
 
 ---
 
@@ -77,11 +81,12 @@ py main.py
 solar_hdr_stacker/
 ├── core/
 │   ├── exif_and_analysis.py  # EXIF čtení a analýza jasu
-│   ├── aligner.py            # Eclipse disc, ECC, ORB, MTB zarovnání
+│   ├── aligner.py            # Detektor černého disku Měsíce a subpixelové posuny
 │   ├── merger.py             # Mertens, Debevec, Robertson fúze
 │   └── postprocess.py        # LUT postprocess, denoise & coronal enhancer
 ├── gui/
 │   ├── main_window.py        # Hlavní okno a realtime rendering
+│   ├── manual_align_dialog.py # Okno pro ruční/asistované dozarovnání fotek
 │   ├── image_viewer.py       # Zoomovatelný prohlížeč & srovnávač
 │   ├── exposure_list_widget.py # Seznam a správa expozic
 │   ├── controls_panel.py     # Ovládací panel posuvníků

@@ -60,6 +60,7 @@ class ControlsPanel(QWidget):
     """
     stack_requested = pyqtSignal()
     live_adjust_requested = pyqtSignal()
+    manual_align_requested = pyqtSignal()
     export_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -111,16 +112,17 @@ class ControlsPanel(QWidget):
         align_row = QHBoxLayout()
         align_row.addWidget(QLabel("Zarovnání:"))
         self.combo_align = QComboBox()
+        self.combo_align.addItem("🌑 Detekce černého disku Měsíce", "eclipse_disc")
         self.combo_align.addItem("🚫 Bez zarovnání (Stativ / Krajina + Slunce)", "none")
-        self.combo_align.addItem("☀️ Zarovnat pouze Slunce (Výřez oblohy)", "sun_only")
-        self.combo_align.addItem("🏔️ Zarovnat podle krajiny (Popředí)", "landscape_only")
-        self.combo_align.addItem("🌑 Detail disku zatmění (Subpixel)", "eclipse_disc")
-        self.combo_align.addItem("⚡ Globální ECC", "ecc")
-        self.combo_align.addItem("🔍 Globální ORB body", "orb")
-        self.combo_align.addItem("📐 Globální MTB", "mtb")
-        self.combo_align.setToolTip("Pokud je na snímku jak statická krajina, tak pohybující se Slunce, je nejlepší 'Bez zarovnání' nebo 'Zarovnat pouze Slunce'.")
+        self.combo_align.setToolTip("Detekuje černý kruhový disk Měsíce obklopený světlem korony a subpixelově zarovná snímky.")
         align_row.addWidget(self.combo_align)
         algo_layout.addLayout(align_row)
+
+        # Manual Alignment Button
+        self.btn_manual_align = QPushButton("🛠️ Ruční dozarovnání fotku po fotce...")
+        self.btn_manual_align.setToolTip("Otevře interaktivní okno pro přesné manuální posouvání každé fotky pomocí šipek a rozdílového náhledu.")
+        self.btn_manual_align.clicked.connect(self.manual_align_requested.emit)
+        algo_layout.addWidget(self.btn_manual_align)
 
         # Mertens Weights Container
         self.mertens_box = QWidget()

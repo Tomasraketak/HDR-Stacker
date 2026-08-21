@@ -1,6 +1,6 @@
 """
 Automated unit & integration test for Astro HDR Stacker.
-Tests synthetic exposure generation, multi-algorithm alignment (Eclipse disc, ECC, ORB, MTB),
+Tests synthetic exposure generation, Black Circle detection, multi-algorithm alignment,
 Mertens fusion, Debevec HDR, denoise filter, coronal enhancement, and file exports.
 """
 
@@ -15,7 +15,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, PROJECT_ROOT)
 
 from core.exif_and_analysis import inspect_exposure_files
-from core.aligner import ImageAligner
+from core.aligner import ImageAligner, detect_black_circle_in_light, calculate_moon_shifts, apply_shifts_to_images
 from core.merger import HDRMerger
 from core.postprocess import apply_postprocessing, save_image, build_tone_curve_lut, apply_denoise
 
@@ -88,13 +88,19 @@ def run_all_tests():
         times = [it.exposure_time for it in items]
         assert all(img is not None for img in images), "All images should load"
 
-        # 4. Test Multi-Algorithm Alignment
-        print("3. Testing multi-algorithm alignment...")
-        for method in ["eclipse_disc", "ecc", "orb", "mtb", "none"]:
-            aligner = ImageAligner(method=method, max_bits=4, exclude_range=4)
-            aligned = aligner.align(images)
-            assert len(aligned) == 9, f"Alignment failed for method: {method}"
-            print(f"   [OK] Alignment method '{method}' passed.")
+        # 4. Test Black Circle in Light Detection & Moon Shifts
+        print("3. Testing Black Circle in Light Detector...")
+        circle = detect_black_circle_in_light(images[4])
+        assert circle is not None, "Failed to detect moon silhouette"
+        cx, cy, r_det = circle
+        assert 150 < cx < 250 and 150 < cy < 250 and 35 < r_det < 60, f"Detected circle unexpected: {circle}"
+        print(f"   [OK] Moon disc detected at cx={cx:.1f}, cy={cy:.1f}, r={r_det:.1f}px.")
+
+        shifts = calculate_moon_shifts(images)
+        assert len(shifts) == 9
+        aligned = apply_shifts_to_images(images, shifts)
+        assert len(aligned) == 9
+        print("   [OK] Moon shift calculation and application passed.")
 
         # 5. Test Mertens Exposure Fusion
         print("4. Testing Mertens Exposure Fusion with noise suppression...")
@@ -147,6 +153,7 @@ def run_all_tests():
         from gui.controls_panel import ControlsPanel
         from gui.exposure_list_widget import ExposureListWidget
         from gui.image_viewer import InteractiveImageViewer
+        from gui.manual_align_dialog import ManualAlignDialog
         from gui.main_window import MainWindow
         print("   [OK] All PyQt6 modules imported cleanly.")
 
