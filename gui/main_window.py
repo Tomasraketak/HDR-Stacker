@@ -1,13 +1,14 @@
 """
 Main Application Window for Astro HDR Stacker.
-Orchestrates UI components, threading, drag & drop, and processing pipelines.
+Features fast proxy-resolution interactive workflow (1/4 or 1/8 scale for instant stacking/editing)
+and asynchronous full-resolution background rendering upon export.
 """
 
 import os
 from typing import List, Optional, Dict, Any
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
@@ -35,15 +36,16 @@ except ImportError:
 
 
 class StackingWorker(QThread):
-    """Background worker for loading, aligning, and merging exposures."""
+    """Background worker for fast proxy-resolution stacking and alignment."""
     progress = pyqtSignal(int, str)
     finished_success = pyqtSignal(object, object)  # (base_f32_bgr, hdr_radiance_map_or_None)
     failed = pyqtSignal(str)
 
-    def __init__(self, items: List[ExposureItem], settings: Dict[str, Any]):
+    def __init__(self, items: List[ExposureItem], settings: Dict[str, Any], scale: float = 0.25):
         super().__init__()
         self.items = items
         self.settings = settings
+        self.scale = max(0.05, min(1.0, float(scale)))
 
     def run(self):
         try:
@@ -51,45 +53,49 @@ class StackingWorker(QThread):
                 self.failed.emit("K HDR složení jsou potřeba alespoň 2 snímky.")
                 return
 
-            # 1. Load full resolution images
             images = []
             times = []
             total_items = len(self.items)
 
             for idx, item in enumerate(self.items):
-                pct = int(10 + (idx / total_items) * 25)
+                pct = int(10 + (idx / total_items) * 30)
                 self.progress.emit(pct, f"Načítání snímku {idx+1}/{total_items}: {item.filename}")
                 
                 img = cv2.imdecode(np.fromfile(item.filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if img is None:
                     self.failed.emit(f"Nelze načíst soubor: {item.filepath}")
                     return
+
+                # Downscale for ultra-fast proxy editing
+                if self.scale < 0.99:
+                    h, w = img.shape[:2]
+                    nw, nh = max(16, int(w * self.scale)), max(16, int(h * self.scale))
+                    img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+
                 images.append(img)
                 times.append(max(1e-6, item.exposure_time))
 
-            # 2. Check dimensions consistency
             h0, w0 = images[0].shape[:2]
             for i, img in enumerate(images):
                 if img.shape[:2] != (h0, w0):
-                    self.progress.emit(38, f"Přizpůsobení rozměrů snímku {i+1}...")
                     images[i] = cv2.resize(img, (w0, h0), interpolation=cv2.INTER_AREA)
 
-            # 3. Multi-Algorithm Alignment
-            align_method = self.settings.get('align_method', 'eclipse_disc')
+            # Alignment
+            align_method = self.settings.get('align_method', 'none')
             if align_method != 'none':
-                self.progress.emit(40, f"Probíhá zarovnávání ({align_method})...")
-                aligner = ImageAligner(method=align_method, max_bits=5, exclude_range=4, cut=False)
+                self.progress.emit(45, f"Zarovnávání ({align_method})...")
+                aligner = ImageAligner(method=align_method, max_bits=4, exclude_range=4, cut=False)
                 images = aligner.align(
                     images,
-                    progress_callback=lambda p, msg: self.progress.emit(int(40 + p * 0.3), msg)
+                    progress_callback=lambda p, msg: self.progress.emit(int(45 + p * 0.25), msg)
                 )
 
-            # 4. Fusion / HDR Stacking
+            # Merge
             algo = self.settings.get('algo', 'mertens')
             hdr_radiance = None
 
             if algo == 'mertens':
-                self.progress.emit(75, "Probíhá víceúrovňová Laplaceova fúze (Mertens)...")
+                self.progress.emit(75, "Probíhá rychlá Laplaceova fúze...")
                 base_merged = HDRMerger.merge_mertens(
                     images,
                     contrast_weight=self.settings.get('mertens_contrast', 1.0),
@@ -97,23 +103,12 @@ class StackingWorker(QThread):
                     exposure_weight=self.settings.get('mertens_exposure', 1.0),
                     progress_callback=lambda p, msg: self.progress.emit(int(75 + p * 0.2), msg)
                 )
-            elif algo == 'debevec':
-                self.progress.emit(75, "Generování Debevec HDR Radiance mapy...")
-                hdr_radiance, crf = HDRMerger.merge_debevec(
-                    images, times,
-                    progress_callback=lambda p, msg: self.progress.emit(int(75 + p * 0.15), msg)
-                )
-                self.progress.emit(90, "Tonemapping...")
-                base_merged = HDRMerger.tonemap(
-                    hdr_radiance,
-                    method=self.settings.get('tonemap_method', 'reinhard')
-                )
-            elif algo == 'robertson':
-                self.progress.emit(75, "Generování Robertson HDR mapy...")
-                hdr_radiance, crf = HDRMerger.merge_robertson(
-                    images, times,
-                    progress_callback=lambda p, msg: self.progress.emit(int(75 + p * 0.15), msg)
-                )
+            elif algo in ('debevec', 'robertson'):
+                self.progress.emit(75, f"Generování {algo.capitalize()} HDR mapy...")
+                if algo == 'debevec':
+                    hdr_radiance, _ = HDRMerger.merge_debevec(images, times)
+                else:
+                    hdr_radiance, _ = HDRMerger.merge_robertson(images, times)
                 self.progress.emit(90, "Tonemapping...")
                 base_merged = HDRMerger.tonemap(
                     hdr_radiance,
@@ -123,11 +118,98 @@ class StackingWorker(QThread):
                 self.failed.emit(f"Neznámý algoritmus: {algo}")
                 return
 
-            self.progress.emit(100, "Skládání úspěšně dokončeno.")
+            self.progress.emit(100, "Složení dokončeno.")
             self.finished_success.emit(base_merged, hdr_radiance)
 
         except Exception as e:
-            self.failed.emit(f"Chyba při zpracování: {str(e)}")
+            self.failed.emit(f"Chyba při skládání: {str(e)}")
+
+
+class FullResExportWorker(QThread):
+    """Background worker for rendering and saving final 100% full-resolution file."""
+    progress = pyqtSignal(int, str)
+    finished_success = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, items: List[ExposureItem], settings: Dict[str, Any], export_filepath: str):
+        super().__init__()
+        self.items = items
+        self.settings = settings
+        self.export_filepath = export_filepath
+
+    def run(self):
+        try:
+            total_items = len(self.items)
+            images = []
+            times = []
+
+            for idx, item in enumerate(self.items):
+                pct = int(5 + (idx / total_items) * 35)
+                self.progress.emit(pct, f"Načítání plného rozlišení {idx+1}/{total_items}: {item.filename}")
+                img = cv2.imdecode(np.fromfile(item.filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if img is None:
+                    self.failed.emit(f"Nelze načíst soubor: {item.filepath}")
+                    return
+                images.append(img)
+                times.append(max(1e-6, item.exposure_time))
+
+            h0, w0 = images[0].shape[:2]
+            for i, img in enumerate(images):
+                if img.shape[:2] != (h0, w0):
+                    images[i] = cv2.resize(img, (w0, h0), interpolation=cv2.INTER_AREA)
+
+            align_method = self.settings.get('align_method', 'none')
+            if align_method != 'none':
+                self.progress.emit(42, f"Zarovnávání v plném rozlišení ({align_method})...")
+                aligner = ImageAligner(method=align_method, max_bits=5, exclude_range=4, cut=False)
+                images = aligner.align(images, progress_callback=lambda p, msg: self.progress.emit(int(42 + p * 0.25), msg))
+
+            algo = self.settings.get('algo', 'mertens')
+            hdr_radiance = None
+
+            if algo == 'mertens':
+                self.progress.emit(70, "Skládání plné kvality (Mertens Exposure Fusion)...")
+                base_merged = HDRMerger.merge_mertens(
+                    images,
+                    contrast_weight=self.settings.get('mertens_contrast', 1.0),
+                    saturation_weight=self.settings.get('mertens_saturation', 1.0),
+                    exposure_weight=self.settings.get('mertens_exposure', 1.0),
+                    progress_callback=lambda p, msg: self.progress.emit(int(70 + p * 0.15), msg)
+                )
+            else:
+                self.progress.emit(70, f"Generování {algo.capitalize()} 32-bit HDR...")
+                if algo == 'debevec':
+                    hdr_radiance, _ = HDRMerger.merge_debevec(images, times)
+                else:
+                    hdr_radiance, _ = HDRMerger.merge_robertson(images, times)
+                self.progress.emit(82, "Tonemapping...")
+                base_merged = HDRMerger.tonemap(hdr_radiance, method=self.settings.get('tonemap_method', 'reinhard'))
+
+            self.progress.emit(88, "Aplikace postprocessingu a barev v plné kvalitě...")
+            final_proc = apply_postprocessing(
+                base_merged,
+                brightness=self.settings['brightness'],
+                contrast=self.settings['contrast'],
+                gamma=self.settings['gamma'],
+                saturation=self.settings['saturation'],
+                coronal_boost=self.settings['coronal_boost'],
+                coronal_radius=self.settings['coronal_radius'],
+                shadow_lift=self.settings['shadows'],
+                highlight_drop=self.settings['highlights'],
+                denoise_strength=self.settings['denoise']
+            )
+
+            self.progress.emit(95, f"Ukládání souboru {os.path.basename(self.export_filepath)}...")
+            success = save_image(self.export_filepath, final_proc, hdr_radiance_map=hdr_radiance, jpeg_quality=100)
+
+            if success:
+                self.progress.emit(100, "Export úspěšně dokončen.")
+                self.finished_success.emit(self.export_filepath)
+            else:
+                self.failed.emit("Chyba při zápisu souboru na disk.")
+
+        except Exception as e:
+            self.failed.emit(f"Chyba při exportu: {str(e)}")
 
 
 class MainWindow(QMainWindow):
@@ -141,18 +223,10 @@ class MainWindow(QMainWindow):
         self.setAcceptDrops(True)
         self.setStyleSheet(DARK_THEME)
 
-        # Internal state
-        self._raw_merged_bgr: Optional[np.ndarray] = None      # Full res float32 merged image [0, 1]
-        self._preview_base_bgr: Optional[np.ndarray] = None    # Fast viewport resolution for 60 FPS live slider dragging
-        self._processed_bgr: Optional[np.ndarray] = None       # Full res postprocessed float32 image
-        self._hdr_radiance_map: Optional[np.ndarray] = None    # 32-bit linear radiance map if available
+        self._base_merged_bgr: Optional[np.ndarray] = None
+        self._hdr_radiance_map: Optional[np.ndarray] = None
         self._worker: Optional[StackingWorker] = None
-        
-        # Debounce timer for background full-res update after slider movement
-        self._fullres_timer = QTimer()
-        self._fullres_timer.setSingleShot(True)
-        self._fullres_timer.setInterval(200)  # 200ms after slider release
-        self._fullres_timer.timeout.connect(self._apply_postprocessing_full)
+        self._export_worker: Optional[FullResExportWorker] = None
 
         self._init_ui()
 
@@ -179,7 +253,7 @@ class MainWindow(QMainWindow):
         self.controls = ControlsPanel()
         self.controls.setMinimumWidth(320)
         self.controls.stack_requested.connect(self.start_stacking)
-        self.controls.live_adjust_requested.connect(self._on_live_slider_changed)
+        self.controls.live_adjust_requested.connect(self._apply_postprocessing_live)
         self.controls.export_requested.connect(self.export_result)
         splitter.addWidget(self.controls)
 
@@ -256,10 +330,11 @@ class MainWindow(QMainWindow):
         self.controls.btn_export.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        self.lbl_status.setText("Zahajuji skládání expozic...")
+        self.lbl_status.setText("Zahajuji rychlé skládání...")
 
         settings = self.controls.get_settings()
-        self._worker = StackingWorker(items, settings)
+        scale = settings.get('proxy_scale', 0.25)
+        self._worker = StackingWorker(items, settings, scale=scale)
         self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished_success.connect(self._on_stacking_success)
         self._worker.failed.connect(self._on_stacking_failed)
@@ -274,34 +349,22 @@ class MainWindow(QMainWindow):
         self.controls.btn_export.setEnabled(True)
         self.progress_bar.setVisible(False)
         
-        self._raw_merged_bgr = base_bgr
+        self._base_merged_bgr = base_bgr
         self._hdr_radiance_map = hdr_radiance
-        
-        # Build fast viewport cache for instant live adjustments
-        h, w = base_bgr.shape[:2]
-        max_preview_dim = 1600
-        if max(h, w) > max_preview_dim:
-            scale = max_preview_dim / float(max(h, w))
-            self._preview_base_bgr = cv2.resize(
-                base_bgr, (int(w * scale), int(h * scale)),
-                interpolation=cv2.INTER_AREA
-            )
-        else:
-            self._preview_base_bgr = base_bgr.copy()
 
-        # Set reference for comparison slider
         active_items = self.exposure_list.get_active_items()
         if active_items:
             mid_idx = len(active_items) // 2
             mid_path = active_items[mid_idx].filepath
             mid_img = cv2.imdecode(np.fromfile(mid_path, dtype=np.uint8), cv2.IMREAD_COLOR)
             if mid_img is not None:
-                self.viewer_container.viewer.set_compare_image_bgr_float(mid_img.astype(np.float32) / 255.0)
+                h, w = base_bgr.shape[:2]
+                mid_small = cv2.resize(mid_img, (w, h), interpolation=cv2.INTER_AREA)
+                self.viewer_container.viewer.set_compare_image_bgr_float(mid_small.astype(np.float32) / 255.0)
 
-        # Immediate display
-        self._apply_postprocessing_instant()
-        self._apply_postprocessing_full()
-        self.lbl_status.setText("✅ HDR složení dokončeno! Posuvníky vpravo reagují okamžitě živě.")
+        self._apply_postprocessing_live()
+        scale_pct = int(self.controls.get_settings().get('proxy_scale', 0.25) * 100)
+        self.lbl_status.setText(f"✅ Složeno ({scale_pct}% rychlý náhled). Posuvníky reagují živě! Při exportu se spočítá 100% plná kvalita.")
 
     def _on_stacking_failed(self, err_msg: str):
         self.controls.btn_stack.setEnabled(True)
@@ -309,40 +372,14 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(f"❌ Chyba: {err_msg}")
         QMessageBox.critical(self, "Chyba skládání", err_msg)
 
-    # ------------------ Instant Live Slider Processing ------------------
-    def _on_live_slider_changed(self):
-        if self._preview_base_bgr is not None:
-            self._apply_postprocessing_instant()
-            self._fullres_timer.start()
-
-    def _apply_postprocessing_instant(self):
-        """Instant sub-5ms screen update during slider dragging."""
-        if self._preview_base_bgr is None:
+    # ------------------ Real-time Postprocessing ------------------
+    def _apply_postprocessing_live(self):
+        if self._base_merged_bgr is None:
             return
 
         settings = self.controls.get_settings()
         proc = apply_postprocessing(
-            self._preview_base_bgr,
-            brightness=settings['brightness'],
-            contrast=settings['contrast'],
-            gamma=settings['gamma'],
-            saturation=settings['saturation'],
-            coronal_boost=settings['coronal_boost'],
-            coronal_radius=settings['coronal_radius'] * 0.7,
-            shadow_lift=settings['shadows'],
-            highlight_drop=settings['highlights'],
-            denoise_strength=settings['denoise']
-        )
-        self.viewer_container.viewer.set_image_bgr_float(proc)
-
-    def _apply_postprocessing_full(self):
-        """Full resolution background render."""
-        if self._raw_merged_bgr is None:
-            return
-
-        settings = self.controls.get_settings()
-        self._processed_bgr = apply_postprocessing(
-            self._raw_merged_bgr,
+            self._base_merged_bgr,
             brightness=settings['brightness'],
             contrast=settings['contrast'],
             gamma=settings['gamma'],
@@ -353,43 +390,51 @@ class MainWindow(QMainWindow):
             highlight_drop=settings['highlights'],
             denoise_strength=settings['denoise']
         )
-        self.viewer_container.viewer.set_image_bgr_float(self._processed_bgr)
+        self.viewer_container.viewer.set_image_bgr_float(proc)
 
-    # ------------------ Export ------------------
+    # ------------------ Full Resolution Background Export ------------------
     def export_result(self):
-        if self._raw_merged_bgr is None:
+        items = self.exposure_list.get_active_items()
+        if not items:
             return
 
         filepath, _ = QFileDialog.getSaveFileName(
             self,
-            "Uložit složený HDR snímek",
-            "eclipse_hdr_result.tif",
+            "Uložit výsledný HDR snímek v plné kvalitě",
+            "eclipse_hdr_fullres.tif",
             "16-bit TIFF (*.tif *.tiff);;JPEG vysoká kvalita (*.jpg);;PNG (*.png);;32-bit Radiance HDR (*.hdr)"
         )
 
         if not filepath:
             return
 
-        self.lbl_status.setText(f"Exportuji plné rozlišení do: {os.path.basename(filepath)}...")
-        QApplication.processEvents()
+        self.controls.btn_stack.setEnabled(False)
+        self.controls.btn_export.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.lbl_status.setText(f"Probíhá výpočet v plné kvalitě a export do {os.path.basename(filepath)}...")
 
-        # Render full resolution with current settings
-        self._apply_postprocessing_full()
+        settings = self.controls.get_settings()
+        self._export_worker = FullResExportWorker(items, settings, filepath)
+        self._export_worker.progress.connect(self._on_worker_progress)
+        self._export_worker.finished_success.connect(self._on_export_success)
+        self._export_worker.failed.connect(self._on_export_failed)
+        self._export_worker.start()
 
-        success = save_image(
-            filepath,
-            self._processed_bgr,
-            hdr_radiance_map=self._hdr_radiance_map,
-            jpeg_quality=100
+    def _on_export_success(self, filepath: str):
+        self.controls.btn_stack.setEnabled(True)
+        self.controls.btn_export.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.lbl_status.setText(f"✅ Snímek úspěšně vyexportován v plné kvalitě: {os.path.basename(filepath)}")
+        QMessageBox.information(
+            self,
+            "Export dokončen",
+            f"HDR snímek byl v plné 100% kvalitě úspěšně složen a uložen do:\n{filepath}"
         )
 
-        if success:
-            self.lbl_status.setText(f"✅ Snímek úspěšně uložen: {os.path.basename(filepath)}")
-            QMessageBox.information(
-                self,
-                "Export dokončen",
-                f"Složený snímek byl úspěšně uložen do:\n{filepath}"
-            )
-        else:
-            self.lbl_status.setText("❌ Chyba při ukládání souboru.")
-            QMessageBox.critical(self, "Chyba", f"Nepodařilo se uložit soubor do:\n{filepath}")
+    def _on_export_failed(self, err_msg: str):
+        self.controls.btn_stack.setEnabled(True)
+        self.controls.btn_export.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.lbl_status.setText(f"❌ Chyba při exportu: {err_msg}")
+        QMessageBox.critical(self, "Chyba exportu", err_msg)

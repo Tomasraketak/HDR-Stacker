@@ -1,6 +1,6 @@
 """
 Controls Panel Widget.
-Houses parameters for HDR fusion, multi-algorithm alignment,
+Houses parameters for HDR fusion, alignment strategy, proxy working resolution,
 noise reduction, coronal enhancement, and live post-processing adjustments.
 """
 
@@ -56,10 +56,10 @@ class SliderRow(QWidget):
 
 class ControlsPanel(QWidget):
     """
-    Control sidebar with tabs for Stacking & Alignment, Post-processing, and Coronal Filters.
+    Control sidebar with Stacking, Alignment, Proxy Mode, and Real-time adjustments.
     """
     stack_requested = pyqtSignal()
-    live_adjust_requested = pyqtSignal()  # Immediate signal for live slider adjustments
+    live_adjust_requested = pyqtSignal()
     export_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -79,15 +79,28 @@ class ControlsPanel(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(12)
 
-        # 1. Stacking Engine & Algorithm Group
-        algo_group = QGroupBox("Algoritmus skládání & Zarovnání")
+        # 1. Stacking Engine & Proxy Speed Group
+        algo_group = QGroupBox("Výpočet a Zarovnání expozic")
         algo_layout = QVBoxLayout(algo_group)
         algo_layout.setSpacing(8)
 
+        # Proxy Quality Selector
+        proxy_row = QHBoxLayout()
+        proxy_row.addWidget(QLabel("Pracovní rychlost:"))
+        self.combo_proxy = QComboBox()
+        self.combo_proxy.addItem("⚡ 1/4 rozlišení (Bleskově rychlé)", 0.25)
+        self.combo_proxy.addItem("🚀 1/8 rozlišení (Ultra rychlé)", 0.125)
+        self.combo_proxy.addItem("⚖️ 1/2 rozlišení (Vyvážené)", 0.5)
+        self.combo_proxy.addItem("🎯 1/1 Plné rozlišení", 1.0)
+        self.combo_proxy.setToolTip("Při práci se fotky zmenší pro okamžité složení a editaci. Plná kvalita se spočítá automaticky až při exportu!")
+        proxy_row.addWidget(self.combo_proxy)
+        algo_layout.addLayout(proxy_row)
+
+        # HDR Method Selector
         algo_row = QHBoxLayout()
         algo_row.addWidget(QLabel("Metoda HDR:"))
         self.combo_algo = QComboBox()
-        self.combo_algo.addItem("Mertens Exposure Fusion (Zatmění)", "mertens")
+        self.combo_algo.addItem("Mertens Exposure Fusion", "mertens")
         self.combo_algo.addItem("Debevec 32-bit HDR", "debevec")
         self.combo_algo.addItem("Robertson 32-bit HDR", "robertson")
         self.combo_algo.currentIndexChanged.connect(self._on_algo_changed)
@@ -98,11 +111,14 @@ class ControlsPanel(QWidget):
         align_row = QHBoxLayout()
         align_row.addWidget(QLabel("Zarovnání:"))
         self.combo_align = QComboBox()
-        self.combo_align.addItem("🌑 Zatmění (Subpixel střed Měsíce/Slunce)", "eclipse_disc")
-        self.combo_align.addItem("⚡ ECC Subpixel (Vysoká přesnost)", "ecc")
-        self.combo_align.addItem("🔍 ORB body (RANSAC)", "orb")
-        self.combo_align.addItem("📐 MTB (Median Threshold)", "mtb")
-        self.combo_align.addItem("🚫 Bez zarovnání (Pevný stativ)", "none")
+        self.combo_align.addItem("🚫 Bez zarovnání (Stativ / Krajina + Slunce)", "none")
+        self.combo_align.addItem("☀️ Zarovnat pouze Slunce (Výřez oblohy)", "sun_only")
+        self.combo_align.addItem("🏔️ Zarovnat podle krajiny (Popředí)", "landscape_only")
+        self.combo_align.addItem("🌑 Detail disku zatmění (Subpixel)", "eclipse_disc")
+        self.combo_align.addItem("⚡ Globální ECC", "ecc")
+        self.combo_align.addItem("🔍 Globální ORB body", "orb")
+        self.combo_align.addItem("📐 Globální MTB", "mtb")
+        self.combo_align.setToolTip("Pokud je na snímku jak statická krajina, tak pohybující se Slunce, je nejlepší 'Bez zarovnání' nebo 'Zarovnat pouze Slunce'.")
         align_row.addWidget(self.combo_align)
         algo_layout.addLayout(align_row)
 
@@ -111,16 +127,12 @@ class ControlsPanel(QWidget):
         m_layout = QVBoxLayout(self.mertens_box)
         m_layout.setContentsMargins(0, 4, 0, 0)
         self.slider_m_contrast = SliderRow("Váha kontrastu:", 0.0, 3.0, 1.0, step=0.1)
-        self.slider_m_contrast.valueChanged.connect(self._on_stack_param_changed)
         m_layout.addWidget(self.slider_m_contrast)
 
         self.slider_m_sat = SliderRow("Váha saturace:", 0.0, 3.0, 1.0, step=0.1)
-        self.slider_m_sat.valueChanged.connect(self._on_stack_param_changed)
         m_layout.addWidget(self.slider_m_sat)
 
-        # Exposure weight 1.0 suppresses shadow noise and grain
-        self.slider_m_exp = SliderRow("Váha expozice (potlačení šumu):", 0.0, 3.0, 1.0, step=0.1)
-        self.slider_m_exp.valueChanged.connect(self._on_stack_param_changed)
+        self.slider_m_exp = SliderRow("Potlačení šumu (Váha expozice):", 0.0, 3.0, 1.0, step=0.1)
         m_layout.addWidget(self.slider_m_exp)
         algo_layout.addWidget(self.mertens_box)
 
@@ -134,7 +146,6 @@ class ControlsPanel(QWidget):
         self.combo_tonemap.addItem("Reinhard", "reinhard")
         self.combo_tonemap.addItem("Drago", "drago")
         self.combo_tonemap.addItem("Mantiuk", "mantiuk")
-        self.combo_tonemap.currentIndexChanged.connect(self._on_stack_param_changed)
         t_row.addWidget(self.combo_tonemap)
         t_layout.addLayout(t_row)
         self.tonemap_box.setVisible(False)
@@ -142,16 +153,16 @@ class ControlsPanel(QWidget):
 
         layout.addWidget(algo_group)
 
-        # 2. Solar Eclipse Coronal Detail & Noise Control
-        corona_group = QGroupBox("Zvýraznění korony & Redukce šumu")
+        # 2. Noise reduction & Coronal detail enhancer
+        corona_group = QGroupBox("Potlačení šumu & Korona")
         corona_layout = QVBoxLayout(corona_group)
         corona_layout.setSpacing(6)
 
-        self.slider_denoise = SliderRow("Redukce šumu (Grain filter):", 0.0, 1.0, 0.0, step=0.05)
+        self.slider_denoise = SliderRow("Redukce šumu (Denoise):", 0.0, 1.0, 0.0, step=0.05)
         self.slider_denoise.valueChanged.connect(self._on_live_param_changed)
         corona_layout.addWidget(self.slider_denoise)
 
-        self.slider_coronal_boost = SliderRow("Zvýraznění paprsků korony:", 0.0, 2.0, 0.0, step=0.05)
+        self.slider_coronal_boost = SliderRow("Zvýraznění detailů korony:", 0.0, 2.0, 0.0, step=0.05)
         self.slider_coronal_boost.valueChanged.connect(self._on_live_param_changed)
         corona_layout.addWidget(self.slider_coronal_boost)
 
@@ -161,8 +172,8 @@ class ControlsPanel(QWidget):
 
         layout.addWidget(corona_group)
 
-        # 3. Live Fine Adjustments (Exposure / Gamma / Colors)
-        adj_group = QGroupBox("Živé úpravy (Okamžitý náhled)")
+        # 3. Live Fine Adjustments
+        adj_group = QGroupBox("Okamžité živé úpravy")
         adj_layout = QVBoxLayout(adj_group)
         adj_layout.setSpacing(6)
 
@@ -186,11 +197,11 @@ class ControlsPanel(QWidget):
         self.slider_shadows.valueChanged.connect(self._on_live_param_changed)
         adj_layout.addWidget(self.slider_shadows)
 
-        self.slider_highlights = SliderRow("Tlumení přepalů:", 0.0, 1.0, 0.0, step=0.05)
+        self.slider_highlights = SliderRow("Tlumení světel:", 0.0, 1.0, 0.0, step=0.05)
         self.slider_highlights.valueChanged.connect(self._on_live_param_changed)
         adj_layout.addWidget(self.slider_highlights)
 
-        self.btn_reset_adj = QPushButton("Obnovit posuvníky na výchozí")
+        self.btn_reset_adj = QPushButton("Obnovit posuvníky")
         self.btn_reset_adj.clicked.connect(self.reset_adjustments)
         adj_layout.addWidget(self.btn_reset_adj)
 
@@ -200,14 +211,14 @@ class ControlsPanel(QWidget):
         scroll.setWidget(scroll_content)
         main_layout.addWidget(scroll)
 
-        # 4. Primary Action Buttons
+        # 4. Action Buttons
         self.btn_stack = QPushButton("⚡ Složit snímky (HDR Merge)")
         self.btn_stack.setObjectName("PrimaryButton")
         self.btn_stack.setMinimumHeight(44)
         self.btn_stack.clicked.connect(self.stack_requested.emit)
         main_layout.addWidget(self.btn_stack)
 
-        self.btn_export = QPushButton("💾 Exportovat výsledek (TIFF / PNG / JPG)")
+        self.btn_export = QPushButton("💾 Exportovat v plné kvalitě (TIFF/JPG)")
         self.btn_export.setObjectName("ExportButton")
         self.btn_export.setMinimumHeight(40)
         self.btn_export.setEnabled(False)
@@ -219,9 +230,6 @@ class ControlsPanel(QWidget):
         is_mertens = (algo == "mertens")
         self.mertens_box.setVisible(is_mertens)
         self.tonemap_box.setVisible(not is_mertens)
-
-    def _on_stack_param_changed(self, _=None):
-        pass
 
     def _on_live_param_changed(self, _=None):
         self.live_adjust_requested.emit()
@@ -240,6 +248,7 @@ class ControlsPanel(QWidget):
 
     def get_settings(self) -> Dict[str, Any]:
         return {
+            'proxy_scale': self.combo_proxy.currentData(),
             'algo': self.combo_algo.currentData(),
             'align_method': self.combo_align.currentData(),
             'mertens_contrast': self.slider_m_contrast.value(),
