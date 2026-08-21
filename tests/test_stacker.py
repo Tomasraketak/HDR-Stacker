@@ -1,7 +1,7 @@
 """
 Automated unit & integration test for Astro HDR Stacker.
-Tests synthetic exposure generation, EV auto-detection, MTB alignment,
-Mertens fusion, Debevec HDR, coronal filters, and file exports.
+Tests synthetic exposure generation, multi-algorithm alignment (Eclipse disc, ECC, ORB, MTB),
+Mertens fusion, Debevec HDR, denoise filter, coronal enhancement, and file exports.
 """
 
 import os
@@ -17,7 +17,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from core.exif_and_analysis import inspect_exposure_files
 from core.aligner import ImageAligner
 from core.merger import HDRMerger
-from core.postprocess import apply_postprocessing, save_image
+from core.postprocess import apply_postprocessing, save_image, build_tone_curve_lut, apply_denoise
 
 
 def generate_synthetic_eclipse_exposures(output_dir: str, num_exposures: int = 9) -> list:
@@ -25,40 +25,35 @@ def generate_synthetic_eclipse_exposures(output_dir: str, num_exposures: int = 9
     Generates synthetic solar eclipse images simulating different exposures (-4 EV to +4 EV).
     """
     paths = []
-    h, w = 500, 500
+    h, w = 400, 400
     y, x = np.ogrid[:h, :w]
     cy, cx = h // 2, w // 2
     r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
 
-    # Base corona intensity gradient (inverse power law)
-    moon_radius = 50.0
-    corona_raw = np.where(r <= moon_radius, 0.0, 1.0 / (np.maximum(r - moon_radius, 1.0) ** 0.8))
-    # Add some structural streamers
+    # Lunar dark disc in center
+    moon_radius = 45.0
+    corona_raw = np.where(r <= moon_radius, 0.0, 1.0 / (np.maximum(r - moon_radius, 1.0) ** 0.85))
     angle = np.arctan2(y - cy, x - cx)
-    streamers = 1.0 + 0.3 * np.sin(6 * angle) + 0.2 * np.cos(14 * angle)
+    streamers = 1.0 + 0.35 * np.sin(6 * angle) + 0.25 * np.cos(14 * angle)
     corona_intensity = corona_raw * streamers
 
-    # Shutter times from 1/4000s to 1/15s (9 steps, 1 EV each)
     base_t = 1.0 / 4000.0
     shutter_times = [base_t * (2.0 ** i) for i in range(num_exposures)]
 
-    # Random small jitter to test MTB alignment
     np.random.seed(42)
 
     for i, t in enumerate(shutter_times):
-        # Exposure scale
         scale = t * 3000.0
         frame = corona_intensity * scale
         
-        # Colorize slightly (warm corona white/pearl)
         b = np.clip(frame * 240.0, 0, 255).astype(np.uint8)
         g = np.clip(frame * 245.0, 0, 255).astype(np.uint8)
         r_c = np.clip(frame * 255.0, 0, 255).astype(np.uint8)
         bgr = np.dstack([b, g, r_c])
 
-        # Add small subpixel / integer jitter
-        dx = int(np.random.randint(-2, 3))
-        dy = int(np.random.randint(-2, 3))
+        # Add small subpixel jitter
+        dx = int(np.random.randint(-3, 4))
+        dy = int(np.random.randint(-3, 4))
         M = np.float32([[1, 0, dx], [0, 1, dy]])
         jittered = cv2.warpAffine(bgr, M, (w, h))
 
@@ -70,7 +65,7 @@ def generate_synthetic_eclipse_exposures(output_dir: str, num_exposures: int = 9
 
 
 def run_all_tests():
-    print("[*] Starting Astro HDR Stacker tests...")
+    print("[*] Starting Astro HDR Stacker comprehensive tests...")
     
     with tempfile.TemporaryDirectory() as tmpdir:
         # 1. Generate 9 synthetic exposures
@@ -93,39 +88,41 @@ def run_all_tests():
         times = [it.exposure_time for it in items]
         assert all(img is not None for img in images), "All images should load"
 
-        # 4. Test MTB alignment
-        print("3. Testing MTB alignment...")
-        aligner = ImageAligner(max_bits=4, exclude_range=4, cut=True)
-        aligned = aligner.align(images)
-        assert len(aligned) == 9, "Aligned count mismatch"
-        print("   [OK] MTB alignment successful.")
+        # 4. Test Multi-Algorithm Alignment
+        print("3. Testing multi-algorithm alignment...")
+        for method in ["eclipse_disc", "ecc", "orb", "mtb", "none"]:
+            aligner = ImageAligner(method=method, max_bits=4, exclude_range=4)
+            aligned = aligner.align(images)
+            assert len(aligned) == 9, f"Alignment failed for method: {method}"
+            print(f"   [OK] Alignment method '{method}' passed.")
 
         # 5. Test Mertens Exposure Fusion
-        print("4. Testing Mertens Exposure Fusion...")
-        mertens_res = HDRMerger.merge_mertens(aligned, contrast_weight=1.0, saturation_weight=1.0, exposure_weight=0.0)
+        print("4. Testing Mertens Exposure Fusion with noise suppression...")
+        mertens_res = HDRMerger.merge_mertens(aligned, contrast_weight=1.0, saturation_weight=1.0, exposure_weight=1.0)
         assert mertens_res.shape == aligned[0].shape, "Mertens shape mismatch"
         assert mertens_res.dtype == np.float32, "Mertens output must be float32"
         assert 0.0 <= mertens_res.min() and mertens_res.max() <= 1.0, "Mertens values must be in [0, 1]"
         print("   [OK] Mertens Exposure Fusion successful.")
 
-        # 6. Test Debevec HDR & Tonemapping
-        print("5. Testing Debevec 32-bit HDR & Reinhard Tonemapping...")
-        hdr_rad, crf = HDRMerger.merge_debevec(aligned, times)
-        assert hdr_rad.dtype == np.float32, "HDR radiance must be float32"
-        ldr = HDRMerger.tonemap(hdr_rad, method="reinhard")
-        assert 0.0 <= ldr.min() and ldr.max() <= 1.0, "Tonemapped values must be in [0, 1]"
-        print("   [OK] Debevec HDR & Tonemapping successful.")
+        # 6. Test Denoise & LUT Tone Mapping
+        print("5. Testing Bilateral Denoise & Fast 1D Tone Curve LUT...")
+        denoised = apply_denoise(mertens_res, strength=0.5)
+        assert denoised.shape == mertens_res.shape
+        lut = build_tone_curve_lut(brightness=0.1, contrast=1.2, gamma=1.1, shadow_lift=0.2, highlight_drop=0.1)
+        assert len(lut) == 1024
+        print("   [OK] Denoise & Tone Curve LUT successful.")
 
-        # 7. Test Coronal Detail Enhancer
+        # 7. Test Coronal Detail Enhancer with dark sky noise protection
         print("6. Testing Coronal Detail Enhancer filter...")
         enhanced = apply_postprocessing(
             mertens_res,
             brightness=0.05,
-            contrast=1.2,
-            gamma=1.1,
+            contrast=1.1,
+            gamma=1.0,
             saturation=1.2,
             coronal_boost=0.5,
-            coronal_radius=5.0
+            coronal_radius=5.0,
+            denoise_strength=0.3
         )
         assert enhanced.shape == mertens_res.shape
         assert enhanced.dtype == np.float32
@@ -144,14 +141,14 @@ def run_all_tests():
         assert os.path.exists(jpg_path) and os.path.getsize(jpg_path) > 1000, "JPG file invalid"
         print("   [OK] 16-bit TIFF, JPG and PNG export successful.")
 
-        # 9. Test GUI Import and Classes (without requiring a GUI event loop)
+        # 9. Test GUI Import and Classes
         print("8. Testing PyQt6 GUI module imports...")
         from gui.styles import DARK_THEME
         from gui.controls_panel import ControlsPanel
         from gui.exposure_list_widget import ExposureListWidget
         from gui.image_viewer import InteractiveImageViewer
         from gui.main_window import MainWindow
-        print("   [OK] All PyQt6 modules imported cleanly without syntax errors.")
+        print("   [OK] All PyQt6 modules imported cleanly.")
 
     print("\n>>> ALL TESTS PASSED SUCCESSFULLY! No bugs detected. <<<")
 

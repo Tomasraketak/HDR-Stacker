@@ -8,11 +8,10 @@ from typing import List, Optional, Dict, Any
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QAction
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
-    QProgressBar, QLabel, QFileDialog, QMessageBox, QStatusBar,
-    QApplication
+    QProgressBar, QLabel, QFileDialog, QMessageBox, QApplication
 )
 
 try:
@@ -58,10 +57,9 @@ class StackingWorker(QThread):
             total_items = len(self.items)
 
             for idx, item in enumerate(self.items):
-                pct = int(10 + (idx / total_items) * 30)
+                pct = int(10 + (idx / total_items) * 25)
                 self.progress.emit(pct, f"Načítání snímku {idx+1}/{total_items}: {item.filename}")
                 
-                # Load with OpenCV supporting UTF-8 filepaths on Windows
                 img = cv2.imdecode(np.fromfile(item.filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if img is None:
                     self.failed.emit(f"Nelze načíst soubor: {item.filepath}")
@@ -73,14 +71,18 @@ class StackingWorker(QThread):
             h0, w0 = images[0].shape[:2]
             for i, img in enumerate(images):
                 if img.shape[:2] != (h0, w0):
-                    self.progress.emit(40, f"Přizpůsobení rozměrů snímku {i+1}...")
+                    self.progress.emit(38, f"Přizpůsobení rozměrů snímku {i+1}...")
                     images[i] = cv2.resize(img, (w0, h0), interpolation=cv2.INTER_AREA)
 
-            # 3. Alignment (MTB)
-            if self.settings.get('align', True):
-                self.progress.emit(45, "Zarovnávání snímků (Median Threshold Bitmap)...")
-                aligner = ImageAligner(max_bits=5, exclude_range=4, cut=True)
-                images = aligner.align(images, progress_callback=lambda p, msg: self.progress.emit(int(45 + p * 0.25), msg))
+            # 3. Multi-Algorithm Alignment
+            align_method = self.settings.get('align_method', 'eclipse_disc')
+            if align_method != 'none':
+                self.progress.emit(40, f"Probíhá zarovnávání ({align_method})...")
+                aligner = ImageAligner(method=align_method, max_bits=5, exclude_range=4, cut=False)
+                images = aligner.align(
+                    images,
+                    progress_callback=lambda p, msg: self.progress.emit(int(40 + p * 0.3), msg)
+                )
 
             # 4. Fusion / HDR Stacking
             algo = self.settings.get('algo', 'mertens')
@@ -92,7 +94,7 @@ class StackingWorker(QThread):
                     images,
                     contrast_weight=self.settings.get('mertens_contrast', 1.0),
                     saturation_weight=self.settings.get('mertens_saturation', 1.0),
-                    exposure_weight=self.settings.get('mertens_exposure', 0.0),
+                    exposure_weight=self.settings.get('mertens_exposure', 1.0),
                     progress_callback=lambda p, msg: self.progress.emit(int(75 + p * 0.2), msg)
                 )
             elif algo == 'debevec':
@@ -140,17 +142,17 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(DARK_THEME)
 
         # Internal state
-        self._raw_merged_bgr: Optional[np.ndarray] = None    # Raw float32 merged image [0, 1]
-        self._processed_bgr: Optional[np.ndarray] = None     # Current postprocessed float32 image
-        self._hdr_radiance_map: Optional[np.ndarray] = None  # 32-bit linear radiance map if available
-        self._preview_cached_bgr: Optional[np.ndarray] = None # Downscaled for ultrafast slider updates
+        self._raw_merged_bgr: Optional[np.ndarray] = None      # Full res float32 merged image [0, 1]
+        self._preview_base_bgr: Optional[np.ndarray] = None    # Fast viewport resolution for 60 FPS live slider dragging
+        self._processed_bgr: Optional[np.ndarray] = None       # Full res postprocessed float32 image
+        self._hdr_radiance_map: Optional[np.ndarray] = None    # 32-bit linear radiance map if available
         self._worker: Optional[StackingWorker] = None
         
-        # Debounce timer for slider adjustments
-        self._slider_timer = QTimer()
-        self._slider_timer.setSingleShot(True)
-        self._slider_timer.setInterval(40)  # 40ms debounce
-        self._slider_timer.timeout.connect(self._apply_postprocessing_live)
+        # Debounce timer for background full-res update after slider movement
+        self._fullres_timer = QTimer()
+        self._fullres_timer.setSingleShot(True)
+        self._fullres_timer.setInterval(200)  # 200ms after slider release
+        self._fullres_timer.timeout.connect(self._apply_postprocessing_full)
 
         self._init_ui()
 
@@ -161,7 +163,6 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(6)
 
-        # Splitter: Left (Exposures), Center (Viewer), Right (Controls)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         
         # 1. Left panel: Exposure list
@@ -178,7 +179,7 @@ class MainWindow(QMainWindow):
         self.controls = ControlsPanel()
         self.controls.setMinimumWidth(320)
         self.controls.stack_requested.connect(self.start_stacking)
-        self.controls.parameters_changed.connect(self._on_parameters_changed)
+        self.controls.live_adjust_requested.connect(self._on_live_slider_changed)
         self.controls.export_requested.connect(self.export_result)
         splitter.addWidget(self.controls)
 
@@ -187,7 +188,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(2, 3)
         main_layout.addWidget(splitter)
 
-        # Bottom Bar: Status label + Progress Bar
+        # Bottom Bar
         bottom_bar = QHBoxLayout()
         bottom_bar.setContentsMargins(4, 2, 4, 2)
         
@@ -251,7 +252,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Prepare UI
         self.controls.btn_stack.setEnabled(False)
         self.controls.btn_export.setEnabled(False)
         self.progress_bar.setVisible(True)
@@ -277,7 +277,19 @@ class MainWindow(QMainWindow):
         self._raw_merged_bgr = base_bgr
         self._hdr_radiance_map = hdr_radiance
         
-        # Set reference for comparison slider (median exposure from list)
+        # Build fast viewport cache for instant live adjustments
+        h, w = base_bgr.shape[:2]
+        max_preview_dim = 1600
+        if max(h, w) > max_preview_dim:
+            scale = max_preview_dim / float(max(h, w))
+            self._preview_base_bgr = cv2.resize(
+                base_bgr, (int(w * scale), int(h * scale)),
+                interpolation=cv2.INTER_AREA
+            )
+        else:
+            self._preview_base_bgr = base_bgr.copy()
+
+        # Set reference for comparison slider
         active_items = self.exposure_list.get_active_items()
         if active_items:
             mid_idx = len(active_items) // 2
@@ -286,9 +298,10 @@ class MainWindow(QMainWindow):
             if mid_img is not None:
                 self.viewer_container.viewer.set_compare_image_bgr_float(mid_img.astype(np.float32) / 255.0)
 
-        # Apply postprocessing
+        # Immediate display
+        self._apply_postprocessing_instant()
         self._apply_postprocessing_full()
-        self.lbl_status.setText("✅ HDR složení úspěšně dokončeno! Upravte posuvníky nebo exportujte.")
+        self.lbl_status.setText("✅ HDR složení dokončeno! Posuvníky vpravo reagují okamžitě živě.")
 
     def _on_stacking_failed(self, err_msg: str):
         self.controls.btn_stack.setEnabled(True)
@@ -296,40 +309,34 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(f"❌ Chyba: {err_msg}")
         QMessageBox.critical(self, "Chyba skládání", err_msg)
 
-    # ------------------ Real-time Postprocessing ------------------
-    def _on_parameters_changed(self):
-        if self._raw_merged_bgr is not None:
-            self._slider_timer.start()
+    # ------------------ Instant Live Slider Processing ------------------
+    def _on_live_slider_changed(self):
+        if self._preview_base_bgr is not None:
+            self._apply_postprocessing_instant()
+            self._fullres_timer.start()
 
-    def _apply_postprocessing_live(self):
-        """Fast live preview update."""
-        if self._raw_merged_bgr is None:
+    def _apply_postprocessing_instant(self):
+        """Instant sub-5ms screen update during slider dragging."""
+        if self._preview_base_bgr is None:
             return
-        
+
         settings = self.controls.get_settings()
-        
-        # For fast responsive preview, if image is very large, compute on downscaled copy
-        h, w = self._raw_merged_bgr.shape[:2]
-        if max(h, w) > 2000:
-            scale = 1600.0 / max(h, w)
-            small = cv2.resize(self._raw_merged_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-            proc_small = apply_postprocessing(
-                small,
-                brightness=settings['brightness'],
-                contrast=settings['contrast'],
-                gamma=settings['gamma'],
-                saturation=settings['saturation'],
-                coronal_boost=settings['coronal_boost'],
-                coronal_radius=settings['coronal_radius'] * scale,
-                shadow_lift=settings['shadows'],
-                highlight_drop=settings['highlights']
-            )
-            self.viewer_container.viewer.set_image_bgr_float(proc_small)
-        else:
-            self._apply_postprocessing_full()
+        proc = apply_postprocessing(
+            self._preview_base_bgr,
+            brightness=settings['brightness'],
+            contrast=settings['contrast'],
+            gamma=settings['gamma'],
+            saturation=settings['saturation'],
+            coronal_boost=settings['coronal_boost'],
+            coronal_radius=settings['coronal_radius'] * 0.7,
+            shadow_lift=settings['shadows'],
+            highlight_drop=settings['highlights'],
+            denoise_strength=settings['denoise']
+        )
+        self.viewer_container.viewer.set_image_bgr_float(proc)
 
     def _apply_postprocessing_full(self):
-        """Full resolution render."""
+        """Full resolution background render."""
         if self._raw_merged_bgr is None:
             return
 
@@ -343,19 +350,17 @@ class MainWindow(QMainWindow):
             coronal_boost=settings['coronal_boost'],
             coronal_radius=settings['coronal_radius'],
             shadow_lift=settings['shadows'],
-            highlight_drop=settings['highlights']
+            highlight_drop=settings['highlights'],
+            denoise_strength=settings['denoise']
         )
         self.viewer_container.viewer.set_image_bgr_float(self._processed_bgr)
 
     # ------------------ Export ------------------
     def export_result(self):
-        if self._processed_bgr is None and self._raw_merged_bgr is not None:
-            self._apply_postprocessing_full()
-            
-        if self._processed_bgr is None:
+        if self._raw_merged_bgr is None:
             return
 
-        filepath, selected_filter = QFileDialog.getSaveFileName(
+        filepath, _ = QFileDialog.getSaveFileName(
             self,
             "Uložit složený HDR snímek",
             "eclipse_hdr_result.tif",
@@ -365,10 +370,10 @@ class MainWindow(QMainWindow):
         if not filepath:
             return
 
-        self.lbl_status.setText(f"Exportuji snímek do: {filepath}...")
+        self.lbl_status.setText(f"Exportuji plné rozlišení do: {os.path.basename(filepath)}...")
         QApplication.processEvents()
 
-        # Ensure full resolution postprocessing is up to date
+        # Render full resolution with current settings
         self._apply_postprocessing_full()
 
         success = save_image(
