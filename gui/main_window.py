@@ -1,7 +1,7 @@
 """
 Main Application Window for Astro HDR Stacker.
 Features fast proxy-resolution interactive workflow, interactive ROI (e.g. 300x300 px crop around Sun for real-time sub-50ms editing),
-manual & assisted frame-by-frame subpixel alignment, and asynchronous full-resolution background rendering.
+manual & assisted frame-by-frame subpixel alignment, thread-safe cancellation, and asynchronous full-resolution background rendering.
 """
 
 import os
@@ -9,7 +9,7 @@ from typing import List, Optional, Dict, Any, Tuple
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QCloseEvent
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
     QProgressBar, QLabel, QFileDialog, QMessageBox, QApplication
@@ -38,7 +38,7 @@ except ImportError:
 
 
 class StackingWorker(QThread):
-    """Background worker for fast proxy-resolution or ROI crop stacking."""
+    """Background worker for fast proxy-resolution or ROI crop stacking with thread-safe cancellation."""
     progress = pyqtSignal(int, str)
     finished_success = pyqtSignal(object, object)  # (base_f32_bgr, hdr_radiance_map_or_None)
     failed = pyqtSignal(str)
@@ -54,7 +54,7 @@ class StackingWorker(QThread):
         self.items = items
         self.settings = settings
         self.scale = max(0.05, min(1.0, float(scale)))
-        self.roi_rect = roi_rect  # (x, y, w, h) in base coordinates
+        self.roi_rect = roi_rect
 
     def run(self):
         try:
@@ -67,6 +67,9 @@ class StackingWorker(QThread):
             total_items = len(self.items)
 
             for idx, item in enumerate(self.items):
+                if self.isInterruptionRequested():
+                    return
+
                 pct = int(10 + (idx / total_items) * 30)
                 self.progress.emit(pct, f"Načítání snímku {idx+1}/{total_items}: {item.filename}")
                 
@@ -79,7 +82,6 @@ class StackingWorker(QThread):
                 if self.roi_rect is not None:
                     rx, ry, rw, rh = self.roi_rect
                     h_orig, w_orig = img.shape[:2]
-                    # Clamp ROI to image boundaries
                     rx_cl = max(0, min(w_orig - 10, rx))
                     ry_cl = max(0, min(h_orig - 10, ry))
                     rw_cl = min(rw, w_orig - rx_cl)
@@ -95,6 +97,9 @@ class StackingWorker(QThread):
                 images.append(img)
                 times.append(max(1e-6, item.exposure_time))
 
+            if self.isInterruptionRequested():
+                return
+
             h0, w0 = images[0].shape[:2]
             for i, img in enumerate(images):
                 if img.shape[:2] != (h0, w0):
@@ -103,7 +108,6 @@ class StackingWorker(QThread):
             # Alignment Check
             has_manual_shifts = any(abs(it.shift_x) > 0.01 or abs(it.shift_y) > 0.01 for it in self.items)
             align_method = self.settings.get('align_method', 'none')
-
             effective_scale = 1.0 if self.roi_rect is not None else self.scale
 
             if has_manual_shifts:
@@ -118,6 +122,9 @@ class StackingWorker(QThread):
                     if effective_scale > 0:
                         self.items[idx].shift_x = round(dx / effective_scale, 1)
                         self.items[idx].shift_y = round(dy / effective_scale, 1)
+
+            if self.isInterruptionRequested():
+                return
 
             # Merge
             algo = self.settings.get('algo', 'mertens')
@@ -147,11 +154,15 @@ class StackingWorker(QThread):
                 self.failed.emit(f"Neznámý algoritmus: {algo}")
                 return
 
+            if self.isInterruptionRequested():
+                return
+
             self.progress.emit(100, "Složení dokončeno.")
             self.finished_success.emit(base_merged, hdr_radiance)
 
         except Exception as e:
-            self.failed.emit(f"Chyba při skládání: {str(e)}")
+            if not self.isInterruptionRequested():
+                self.failed.emit(f"Chyba při skládání: {str(e)}")
 
 
 class FullResExportWorker(QThread):
@@ -173,6 +184,8 @@ class FullResExportWorker(QThread):
             times = []
 
             for idx, item in enumerate(self.items):
+                if self.isInterruptionRequested():
+                    return
                 pct = int(5 + (idx / total_items) * 35)
                 self.progress.emit(pct, f"Načítání plného rozlišení {idx+1}/{total_items}: {item.filename}")
                 img = cv2.imdecode(np.fromfile(item.filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -181,6 +194,9 @@ class FullResExportWorker(QThread):
                     return
                 images.append(img)
                 times.append(max(1e-6, item.exposure_time))
+
+            if self.isInterruptionRequested():
+                return
 
             h0, w0 = images[0].shape[:2]
             for i, img in enumerate(images):
@@ -199,6 +215,9 @@ class FullResExportWorker(QThread):
                 self.progress.emit(42, "Zarovnávám disk Měsíce v plném rozlišení...")
                 shifts = calculate_moon_shifts(images)
                 images = apply_shifts_to_images(images, shifts, scale_factor=1.0)
+
+            if self.isInterruptionRequested():
+                return
 
             algo = self.settings.get('algo', 'mertens')
             hdr_radiance = None
@@ -220,6 +239,9 @@ class FullResExportWorker(QThread):
                     hdr_radiance, _ = HDRMerger.merge_robertson(images, times)
                 self.progress.emit(82, "Tonemapping...")
                 base_merged = HDRMerger.tonemap(hdr_radiance, method=self.settings.get('tonemap_method', 'reinhard'))
+
+            if self.isInterruptionRequested():
+                return
 
             self.progress.emit(88, "Aplikace postprocessingu a barev v plné kvalitě...")
             final_proc = apply_postprocessing(
@@ -245,7 +267,8 @@ class FullResExportWorker(QThread):
                 self.failed.emit("Chyba při zápisu souboru na disk.")
 
         except Exception as e:
-            self.failed.emit(f"Chyba při exportu: {str(e)}")
+            if not self.isInterruptionRequested():
+                self.failed.emit(f"Chyba při exportu: {str(e)}")
 
 
 class MainWindow(QMainWindow):
@@ -255,7 +278,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Astro HDR Stacker — Skládání expozic & Zatmění Slunce")
-        self.resize(1380, 880)
+        self.resize(1280, 800)
         self.setAcceptDrops(True)
         self.setStyleSheet(DARK_THEME)
 
@@ -281,7 +304,6 @@ class MainWindow(QMainWindow):
         
         # 1. Left panel: Exposure list
         self.exposure_list = ExposureListWidget()
-        self.exposure_list.setMinimumWidth(280)
         self.exposure_list.item_selected.connect(self._on_preview_single_exposure)
         splitter.addWidget(self.exposure_list)
 
@@ -293,7 +315,6 @@ class MainWindow(QMainWindow):
 
         # 3. Right panel: Controls
         self.controls = ControlsPanel()
-        self.controls.setMinimumWidth(320)
         self.controls.stack_requested.connect(self.start_stacking)
         self.controls.manual_align_requested.connect(self.open_manual_alignment)
         self.controls.live_adjust_requested.connect(self._apply_postprocessing_live)
@@ -315,11 +336,29 @@ class MainWindow(QMainWindow):
         bottom_bar.addStretch()
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedWidth(260)
+        self.progress_bar.setFixedWidth(240)
         self.progress_bar.setVisible(False)
         bottom_bar.addWidget(self.progress_bar)
 
         main_layout.addLayout(bottom_bar)
+
+    def _cancel_and_wait_worker(self):
+        """Safely stops and waits for any running background worker before spawning a new one."""
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.requestInterruption()
+            self._worker.wait(500)
+            if self._worker.isRunning():
+                self._worker.terminate()
+                self._worker.wait(300)
+            self._worker = None
+
+    def closeEvent(self, event: QCloseEvent):
+        """Gracefully stop background threads when closing the application."""
+        self._cancel_and_wait_worker()
+        if self._export_worker is not None and self._export_worker.isRunning():
+            self._export_worker.requestInterruption()
+            self._export_worker.wait(1000)
+        event.accept()
 
     # ------------------ Drag and Drop ------------------
     def dragEnterEvent(self, event: QDragEnterEvent):
@@ -371,7 +410,6 @@ class MainWindow(QMainWindow):
             self.start_stacking()
 
     def _center_roi_on_sun(self):
-        """Finds Sun / Moon disc and centers the ROI box around it."""
         active_items = self.exposure_list.get_active_items()
         if not active_items:
             return
@@ -412,6 +450,9 @@ class MainWindow(QMainWindow):
                 "Pro HDR složení vyberte v seznamu alespoň 2 aktivní expozice."
             )
             return
+
+        # Safely stop any running previous worker before starting a new one
+        self._cancel_and_wait_worker()
 
         self.controls.btn_stack.setEnabled(False)
         self.controls.btn_export.setEnabled(False)

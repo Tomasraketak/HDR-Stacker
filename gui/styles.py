@@ -142,7 +142,6 @@ QSlider::handle:horizontal {
 
 QSlider::handle:horizontal:hover {
     background: #e6f2ff;
-    transform: scale(1.1);
 }
 
 QTableWidget {
