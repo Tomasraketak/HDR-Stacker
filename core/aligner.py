@@ -2,7 +2,8 @@
 Advanced Astronomical Alignment Engine.
 Features:
 1. Robust Black Circle in Light Detector (specifically locates the circular Moon silhouette surrounded by bright corona).
-2. Per-image subpixel shift calculations and application.
+2. Universal Sun/Moon Center Finder (combines black circle detector with bright corona moment analysis fallback).
+3. Per-image subpixel shift calculations and application.
 """
 
 from typing import List, Callable, Optional, Tuple
@@ -23,24 +24,20 @@ def detect_black_circle_in_light(image_bgr: np.ndarray) -> Optional[Tuple[float,
     blurred = cv2.GaussianBlur(gray, (11, 11), 0)
 
     # 2. Locate the brightest regions (corona) in the sky
-    # Avoid extreme bottom if landscape is present
     sky_h = int(h * 0.9)
     sky_gray = blurred[:sky_h, :]
 
-    # Estimate min & max intensity
-    min_v, max_v, _, max_loc = cv2.minMaxLoc(sky_gray)
+    min_v, max_v, _, _ = cv2.minMaxLoc(sky_gray)
     if max_v < 25:
         return None
 
     # Multi-level threshold search for dark circular void inside bright halo
-    # Test multiple threshold levels from 10% to 60% of dynamic range
     candidate_circles = []
 
     for t_factor in [0.15, 0.25, 0.35, 0.45, 0.55]:
         t_val = int(min_v + (max_v - min_v) * t_factor)
         _, thresh = cv2.threshold(sky_gray, t_val, 255, cv2.THRESH_BINARY_INV)
 
-        # Morphological opening to detach trees/cables
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
         opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
         opened = cv2.morphologyEx(opened, cv2.MORPH_CLOSE, kernel)
@@ -48,7 +45,6 @@ def detect_black_circle_in_light(image_bgr: np.ndarray) -> Optional[Tuple[float,
         contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         for c in contours:
             area = cv2.contourArea(c)
-            # Disc must be reasonably sized (at least 2% and at most 60% of frame)
             min_r = min(w, h) * 0.02
             max_r = min(w, h) * 0.45
             min_area = np.pi * (min_r ** 2)
@@ -57,20 +53,16 @@ def detect_black_circle_in_light(image_bgr: np.ndarray) -> Optional[Tuple[float,
             if min_area <= area <= max_area:
                 perimeter = cv2.arcLength(c, True)
                 if perimeter > 0:
-                    # Circularity metric: 4 * pi * Area / Perimeter^2 (1.0 for perfect circle)
                     circularity = (4.0 * np.pi * area) / (perimeter ** 2)
                     if circularity > 0.65:
                         (cx, cy), r = cv2.minEnclosingCircle(c)
-                        # Verify the center is dark and the boundary is bright
                         cx_int, cy_int = int(cx), int(cy)
                         if 0 <= cx_int < w and 0 <= cy_int < sky_h:
                             center_lum = float(gray[cy_int, cx_int])
-                            # Check ring at radius r * 1.2
                             if center_lum < (max_v * 0.7):
                                 candidate_circles.append(((float(cx), float(cy), float(r)), circularity))
 
     if candidate_circles:
-        # Sort by circularity descending
         candidate_circles.sort(key=lambda x: x[1], reverse=True)
         best_circle = candidate_circles[0][0]
         return best_circle
@@ -93,6 +85,40 @@ def detect_black_circle_in_light(image_bgr: np.ndarray) -> Optional[Tuple[float,
     return None
 
 
+def find_sun_or_moon_center(image_bgr: np.ndarray) -> Tuple[int, int]:
+    """
+    Universal astronomical center finder.
+    1. First attempts strict black lunar disc detection.
+    2. Fallback: computes center of mass of the brightest coronal / solar region.
+    3. Final fallback: center of the frame.
+    """
+    h, w = image_bgr.shape[:2]
+    
+    # 1. Lunar disc in total eclipse
+    disc = detect_black_circle_in_light(image_bgr)
+    if disc is not None:
+        return int(disc[0]), int(disc[1])
+
+    # 2. Coronal glow / Bright Sun center of mass
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (21, 21), 0)
+    
+    min_v, max_v, _, _ = cv2.minMaxLoc(blurred)
+    if max_v > 30:
+        # Threshold top 15% brightest pixels
+        t_val = int(min_v + (max_v - min_v) * 0.85)
+        _, mask = cv2.threshold(blurred, t_val, 255, cv2.THRESH_BINARY)
+        M = cv2.moments(mask)
+        if M["m00"] > 0:
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            if 0 <= cx < w and 0 <= cy < h:
+                return cx, cy
+
+    # 3. Default center of frame
+    return w // 2, h // 2
+
+
 def calculate_moon_shifts(images: List[np.ndarray], ref_idx: Optional[int] = None) -> List[Tuple[float, float]]:
     """
     Detects the black circular lunar disc in each image and computes relative (dx, dy)
@@ -107,10 +133,8 @@ def calculate_moon_shifts(images: List[np.ndarray], ref_idx: Optional[int] = Non
 
     circles = [detect_black_circle_in_light(img) for img in images]
     
-    # Identify reference disc
     ref_disc = circles[ref_idx]
     if ref_disc is None:
-        # Find first valid detection
         for idx, c in enumerate(circles):
             if c is not None:
                 ref_idx = idx
@@ -118,7 +142,6 @@ def calculate_moon_shifts(images: List[np.ndarray], ref_idx: Optional[int] = Non
                 break
 
     if ref_disc is None:
-        # Could not detect on any frame
         return [(0.0, 0.0) for _ in images]
 
     ref_cx, ref_cy, _ = ref_disc
@@ -172,7 +195,7 @@ class ImageAligner:
 
     def __init__(
         self,
-        method: str = "none",  # "none", "eclipse_disc", "sun_only", "landscape_only", "manual", "ecc", "orb", "mtb"
+        method: str = "none",
         manual_shifts: Optional[List[Tuple[float, float]]] = None
     ):
         self.method = method.lower()
@@ -188,13 +211,11 @@ class ImageAligner:
                 progress_callback(100, "Zarovnání vypnuto.")
             return images
 
-        # 1. Manual shifts supplied
         if self.manual_shifts and len(self.manual_shifts) == len(images):
             if progress_callback:
                 progress_callback(50, "Aplikuji ručně zadané posuny expozic...")
             return apply_shifts_to_images(images, self.manual_shifts)
 
-        # 2. Black Circle / Eclipse Disc detection
         if self.method in ("eclipse_disc", "sun_only"):
             if progress_callback:
                 progress_callback(20, "Detekuji černý disk Měsíce v záři korony...")
@@ -203,5 +224,4 @@ class ImageAligner:
                 progress_callback(70, "Aplikuji subpixelové posuny disku...")
             return apply_shifts_to_images(images, shifts)
 
-        # Fallback to no alignment
         return images

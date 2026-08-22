@@ -1,7 +1,7 @@
 """
 Main Application Window for Astro HDR Stacker.
-Features fast proxy-resolution interactive workflow, interactive ROI (e.g. 300x300 px crop around Sun for real-time sub-50ms editing),
-manual & assisted frame-by-frame subpixel alignment, thread-safe cancellation, and asynchronous full-resolution background rendering.
+Features fast proxy-resolution interactive workflow, interactive click-to-center ROI crop around Sun
+for real-time sub-30ms editing, manual & assisted frame-by-frame subpixel alignment, and asynchronous full-resolution background rendering.
 """
 
 import os
@@ -17,7 +17,10 @@ from PyQt6.QtWidgets import (
 
 try:
     from core.exif_and_analysis import ExposureItem
-    from core.aligner import ImageAligner, calculate_moon_shifts, apply_shifts_to_images, detect_black_circle_in_light
+    from core.aligner import (
+        ImageAligner, calculate_moon_shifts, apply_shifts_to_images,
+        detect_black_circle_in_light, find_sun_or_moon_center
+    )
     from core.merger import HDRMerger
     from core.postprocess import apply_postprocessing, save_image
     from gui.exposure_list_widget import ExposureListWidget
@@ -27,7 +30,10 @@ try:
     from gui.styles import DARK_THEME
 except ImportError:
     from ..core.exif_and_analysis import ExposureItem
-    from ..core.aligner import ImageAligner, calculate_moon_shifts, apply_shifts_to_images, detect_black_circle_in_light
+    from ..core.aligner import (
+        ImageAligner, calculate_moon_shifts, apply_shifts_to_images,
+        detect_black_circle_in_light, find_sun_or_moon_center
+    )
     from ..core.merger import HDRMerger
     from ..core.postprocess import apply_postprocessing, save_image
     from .exposure_list_widget import ExposureListWidget
@@ -71,14 +77,17 @@ class StackingWorker(QThread):
                     return
 
                 pct = int(10 + (idx / total_items) * 30)
-                self.progress.emit(pct, f"Načítání snímku {idx+1}/{total_items}: {item.filename}")
+                if self.roi_rect is not None:
+                    self.progress.emit(pct, f"Bleskový výřez {idx+1}/{total_items}: {item.filename}")
+                else:
+                    self.progress.emit(pct, f"Načítání snímku {idx+1}/{total_items}: {item.filename}")
                 
                 img = cv2.imdecode(np.fromfile(item.filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if img is None:
                     self.failed.emit(f"Nelze načíst soubor: {item.filepath}")
                     return
 
-                # If ROI Crop Mode is active, crop directly from original
+                # If ROI Crop Mode is active, crop directly from original image
                 if self.roi_rect is not None:
                     rx, ry, rw, rh = self.roi_rect
                     h_orig, w_orig = img.shape[:2]
@@ -384,6 +393,24 @@ class MainWindow(QMainWindow):
         if filepaths:
             self.exposure_list.load_files(filepaths)
             self.lbl_status.setText(f"Načteno {len(filepaths)} snímků. Připraveno ke složení.")
+            self._setup_initial_preview()
+
+    def _setup_initial_preview(self):
+        """Loads middle exposure to initialize viewport and detect Sun position."""
+        active_items = self.exposure_list.get_active_items()
+        if not active_items:
+            return
+        
+        mid_item = active_items[len(active_items) // 2]
+        img = cv2.imdecode(np.fromfile(mid_item.filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if img is not None:
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            self.viewer_container.viewer.set_base_image_rgb_uint8(rgb, keep_view=False)
+            self.viewer_container.viewer.set_compare_image_bgr_float(img.astype(np.float32) / 255.0)
+            
+            # Pre-detect Sun position
+            cx, cy = find_sun_or_moon_center(img)
+            self.viewer_container.viewer.set_roi_center(cx, cy, emit_signal=False)
 
     # ------------------ Preview single exposure ------------------
     def _on_preview_single_exposure(self, filepath: str):
@@ -391,7 +418,7 @@ class MainWindow(QMainWindow):
             img = cv2.imdecode(np.fromfile(filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
             if img is not None:
                 rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                self.viewer_container.viewer.set_image_rgb_uint8(rgb, keep_view=True)
+                self.viewer_container.viewer.set_base_image_rgb_uint8(rgb, keep_view=True)
                 self.viewer_container.viewer.set_compare_image_bgr_float(img.astype(np.float32) / 255.0)
                 self.lbl_status.setText(f"Náhled expozice: {os.path.basename(filepath)}")
         except Exception as e:
@@ -403,7 +430,7 @@ class MainWindow(QMainWindow):
         self._roi_rect = (x, y, w, h) if enabled else None
         
         if enabled:
-            self.lbl_status.setText(f"🎯 Aktivován bleskový výřez ROI {w}x{h} px. Provádím okamžité složení...")
+            self.lbl_status.setText(f"🎯 Klikněte kamkoliv do fotky pro vycentrování výřezu na Slunce.")
             self.start_stacking()
         else:
             self.lbl_status.setText("Zobrazen celý snímek. Provádím složení plné scény...")
@@ -419,15 +446,9 @@ class MainWindow(QMainWindow):
         if img is None:
             return
 
-        disc = detect_black_circle_in_light(img)
-        if disc is not None:
-            cx, cy, _ = disc
-            self.viewer_container.viewer.set_roi_center(int(cx), int(cy))
-            self.lbl_status.setText(f"☀️ Slunce nalezeno na souřadnicích [{int(cx)}, {int(cy)}]. Výřez vycentrován.")
-        else:
-            h, w = img.shape[:2]
-            self.viewer_container.viewer.set_roi_center(w // 2, h // 2)
-            self.lbl_status.setText("Slunce nebylo automaticky nalezeno, výřez vycentrován na střed snímku.")
+        cx, cy = find_sun_or_moon_center(img)
+        self.viewer_container.viewer.set_roi_center(cx, cy, emit_signal=True)
+        self.lbl_status.setText(f"☀️ Slunce zaměřeno na souřadnicích [{cx}, {cy}]. Provádím okamžité složení výřezu...")
 
     # ------------------ Manual Alignment Dialog ------------------
     def open_manual_alignment(self):
@@ -451,7 +472,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Safely stop any running previous worker before starting a new one
+        # Safely stop any running previous worker
         self._cancel_and_wait_worker()
 
         self.controls.btn_stack.setEnabled(False)
@@ -499,8 +520,8 @@ class MainWindow(QMainWindow):
 
         self._apply_postprocessing_live()
         
-        if self._roi_active:
-            self.lbl_status.setText("⚡ Bleskový výřez ROI složen (odezva <50ms)! Upravujte posuvníky v reálném čase.")
+        if self._roi_active and self._roi_rect is not None:
+            self.lbl_status.setText(f"⚡ Výřez ({self._roi_rect[2]}x{self._roi_rect[3]} px) složen za <30 ms! Kliknutím do fotky ho můžete přesunout.")
         else:
             scale_pct = int(self.controls.get_settings().get('proxy_scale', 0.25) * 100)
             self.lbl_status.setText(f"✅ Složeno ({scale_pct}% rychlý náhled). Posuvníky reagují živě!")
@@ -529,7 +550,12 @@ class MainWindow(QMainWindow):
             highlight_drop=settings['highlights'],
             denoise_strength=settings['denoise']
         )
-        self.viewer_container.viewer.set_image_bgr_float(proc)
+        
+        if self._roi_active and self._roi_rect is not None:
+            rx, ry, rw, rh = self._roi_rect
+            self.viewer_container.viewer.set_roi_crop_bgr_float(proc, rx, ry, rw, rh)
+        else:
+            self.viewer_container.viewer.set_base_image_bgr_float(proc, keep_view=True)
 
     # ------------------ Full Resolution Background Export ------------------
     def export_result(self):
