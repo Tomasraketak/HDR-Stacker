@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QDoubleSpinBox, QGroupBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QRadioButton, QButtonGroup,
-    QMessageBox, QSplitter, QWidget
+    QMessageBox, QSplitter, QWidget, QCheckBox
 )
 
 try:
@@ -57,7 +57,6 @@ class ManualAlignDialog(QDialog):
         # Cache loaded proxy images
         self._cached_images_f32: List[np.ndarray] = []
         self._norm_grays_f32: List[np.ndarray] = []
-        self._load_cached_images()
 
         # Flicker timer
         self._flicker_state = False
@@ -68,19 +67,26 @@ class ManualAlignDialog(QDialog):
         self._init_ui()
 
     def _load_cached_images(self):
+        from PyQt6.QtWidgets import QApplication
         self._cached_images_f32 = []
         self._norm_grays_f32 = []
-        for it in self.items:
+        self._proxy_scales = []
+        total = len(self.items)
+        for i, it in enumerate(self.items):
+            self.lbl_status.setText(f"Načítám snímky do paměti ({i+1}/{total})... čekejte prosím.")
+            QApplication.processEvents()
             img = cv2.imdecode(np.fromfile(it.filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 img = np.zeros((600, 600, 3), dtype=np.uint8)
             h, w = img.shape[:2]
             scale = min(1.0, 1600.0 / max(w, h))
+            self._proxy_scales.append(scale)
             if scale < 0.99:
                 img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
             f32 = img.astype(np.float32) / 255.0
             self._cached_images_f32.append(f32)
             self._norm_grays_f32.append(normalize_for_comparison(f32))
+        self.lbl_status.setText("Snímky načteny. Zarovnejte posuny tak, aby hrany na sebe seděly.")
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
@@ -293,6 +299,10 @@ class ManualAlignDialog(QDialog):
         QTimer.singleShot(50, self._initial_render)
 
     def _initial_render(self):
+        self.lbl_status.setText("Připravuji snímky...")
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+        self._load_cached_images()
         self._update_view()
         self.viewer.fit_to_window()
 
@@ -390,14 +400,17 @@ class ManualAlignDialog(QDialog):
         cur_img = self._cached_images_f32[self.current_idx]
         ref_norm = self._norm_grays_f32[self.ref_idx]
         cur_norm = self._norm_grays_f32[self.current_idx]
+        scale = self._proxy_scales[self.current_idx]
         it = self.items[self.current_idx]
 
         h, w = cur_img.shape[:2]
+        # dx and dy are in FULL RESOLUTION pixels
         dx, dy = it.shift_x, it.shift_y
+        proxy_dx, proxy_dy = dx * scale, dy * scale
 
         # Shift current image and normalized gray
-        if abs(dx) > 0.01 or abs(dy) > 0.01:
-            M = np.float32([[1.0, 0.0, dx], [0.0, 1.0, dy]])
+        if abs(proxy_dx) > 0.01 or abs(proxy_dy) > 0.01:
+            M = np.float32([[1.0, 0.0, proxy_dx], [0.0, 1.0, proxy_dy]])
             cur_shifted = cv2.warpAffine(cur_img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
             cur_norm_shifted = cv2.warpAffine(cur_norm, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT_101)
         else:
@@ -436,14 +449,21 @@ class ManualAlignDialog(QDialog):
     def _auto_detect_moon(self):
         """Runs automatic black circle detection on all frames and sets shifts."""
         self.lbl_status.setText("Probíhá automatické vyhledávání černého disku Měsíce...")
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+        
         raw_bgrs = [(img * 255.0).astype(np.uint8) for img in self._cached_images_f32]
         shifts = calculate_moon_shifts(raw_bgrs, ref_idx=self.ref_idx)
 
         detected_count = 0
-        for idx, (dx, dy) in enumerate(shifts):
+        for idx, (proxy_dx, proxy_dy) in enumerate(shifts):
+            scale = self._proxy_scales[idx]
+            dx = proxy_dx / scale if scale > 0 else proxy_dx
+            dy = proxy_dy / scale if scale > 0 else proxy_dy
+            
             self.items[idx].shift_x = round(dx, 1)
             self.items[idx].shift_y = round(dy, 1)
-            if abs(dx) > 0.01 or abs(dy) > 0.01:
+            if abs(proxy_dx) > 0.01 or abs(proxy_dy) > 0.01:
                 detected_count += 1
 
         self.spin_dx.setValue(self.items[self.current_idx].shift_x)

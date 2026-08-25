@@ -479,7 +479,7 @@ class MainWindow(QMainWindow):
             return
 
         dialog = ManualAlignDialog(items, parent=self)
-        dialog.shifts_applied.connect(self.start_stacking)
+        dialog.shifts_applied.connect(self._on_manual_shifts_applied)
         dialog.exec()
 
     # ------------------ Stacking Execution ------------------
