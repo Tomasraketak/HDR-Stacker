@@ -68,8 +68,19 @@ class HDRMerger:
         if progress_callback:
             progress_callback(20, "Kalibrace odezvy snímače (Debevec CRF)...")
 
+        # Optimization: Calculate CRF on small images to prevent OOM and speed up
+        sample_size = 512
+        small_images = []
+        for img in images:
+            h, w = img.shape[:2]
+            if w > sample_size or h > sample_size:
+                scale = sample_size / max(w, h)
+                small_images.append(cv2.resize(img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA))
+            else:
+                small_images.append(img)
+
         calibrate = cv2.createCalibrateDebevec()
-        crf = calibrate.process(images, times_arr)
+        crf = calibrate.process(small_images, times_arr)
 
         if progress_callback:
             progress_callback(60, "Výpočet 32-bit lineární mapy jasu (Radiance Map)...")
@@ -96,8 +107,18 @@ class HDRMerger:
         if progress_callback:
             progress_callback(20, "Kalibrace odezvy snímače (Robertson CRF)...")
 
+        sample_size = 512
+        small_images = []
+        for img in images:
+            h, w = img.shape[:2]
+            if w > sample_size or h > sample_size:
+                scale = sample_size / max(w, h)
+                small_images.append(cv2.resize(img, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA))
+            else:
+                small_images.append(img)
+
         calibrate = cv2.createCalibrateRobertson()
-        crf = calibrate.process(images, times_arr)
+        crf = calibrate.process(small_images, times_arr)
 
         if progress_callback:
             progress_callback(60, "Výpočet Robertson HDR mapy...")

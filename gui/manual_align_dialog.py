@@ -98,23 +98,35 @@ class ManualAlignDialog(QDialog):
         # Frame navigation
         nav_group = QGroupBox("Výběr zarovnávaného snímku")
         nav_layout = QVBoxLayout(nav_group)
+        top_ctrl = QHBoxLayout()
 
+        lbl_frame = QLabel("Snímek:")
         self.combo_frame = QComboBox()
-        for idx, it in enumerate(self.items):
-            is_ref = " (REFERENČNÍ BÁZE)" if idx == self.ref_idx else ""
-            self.combo_frame.addItem(f"{idx+1}. {it.filename} [{it.shutter_str}]{is_ref}", idx)
+        for i, it in enumerate(self.items):
+            sign = "*" if i == self.ref_idx else f"{i+1}"
+            self.combo_frame.addItem(f"[{sign}] {it.filename} ({it.shutter_str})", i)
         self.combo_frame.setCurrentIndex(self.current_idx)
         self.combo_frame.currentIndexChanged.connect(self._on_frame_selected)
-        nav_layout.addWidget(self.combo_frame)
+        top_ctrl.addWidget(lbl_frame)
+        top_ctrl.addWidget(self.combo_frame)
 
-        nav_btns = QHBoxLayout()
-        self.btn_prev = QPushButton("◀ Předchozí")
+        self.btn_prev = QPushButton("◄")
+        self.btn_prev.setFixedWidth(30)
         self.btn_prev.clicked.connect(self._prev_frame)
-        nav_btns.addWidget(self.btn_prev)
-        self.btn_next = QPushButton("Další ▶")
+        top_ctrl.addWidget(self.btn_prev)
+        
+        self.btn_next = QPushButton("►")
+        self.btn_next.setFixedWidth(30)
         self.btn_next.clicked.connect(self._next_frame)
-        nav_btns.addWidget(self.btn_next)
-        nav_layout.addLayout(nav_btns)
+        top_ctrl.addWidget(self.btn_next)
+        
+        # Add checkbox to enable/disable frame
+        self.chk_active = QCheckBox("Zahrnout do skládání")
+        self.chk_active.stateChanged.connect(self._on_chk_active_changed)
+        top_ctrl.addWidget(self.chk_active)
+
+        top_ctrl.addStretch()
+        nav_layout.addLayout(top_ctrl)
         l_layout.addWidget(nav_group)
 
         # Display Mode (Difference, Blend, Flicker)
@@ -312,11 +324,20 @@ class ManualAlignDialog(QDialog):
         it = self.items[idx]
         self.spin_dx.blockSignals(True)
         self.spin_dy.blockSignals(True)
+        self.chk_active.blockSignals(True)
         self.spin_dx.setValue(it.shift_x)
         self.spin_dy.setValue(it.shift_y)
+        self.chk_active.setChecked(it.is_valid)
         self.spin_dx.blockSignals(False)
         self.spin_dy.blockSignals(False)
+        self.chk_active.blockSignals(False)
         self._update_view()
+        
+    def _on_chk_active_changed(self, state: int):
+        it = self.items[self.current_idx]
+        it.is_valid = (state == Qt.CheckState.Checked.value or state == 2)
+        # We need to trigger table update in main window too, but this dialog shares `items` objects.
+        # It will be applied when dialog closes.
 
     def _prev_frame(self):
         new_idx = max(0, self.current_idx - 1)

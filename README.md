@@ -1,66 +1,67 @@
-# 🌘 Astro HDR Stacker — Solar Eclipse & Exposure Fusion Studio
+# 🌞 Astro HDR Stacker — Solar Eclipse & Exposure Fusion Studio
 
-Profesionální desktopová aplikace v Pythonu (PyQt6 + OpenCV) pro skládání expozičních řad fotografií do jednoho HDR snímku s vysokým dynamickým rozsahem. Navržena speciálně pro náročné astrofotografické scény jako je **úplné zatmění Slunce**, korona, protuberance i pro klasické pozemské HDR fotografie.
+A professional desktop application in Python (PyQt6 + OpenCV) for stacking exposure brackets into a single High Dynamic Range (HDR) image. Designed specifically for demanding astrophotography scenes such as **Total Solar Eclipses**, the solar corona, prominences, as well as classic landscape HDR photography.
 
 ---
 
-## ✨ Klíčové funkce
+## 🚀 Key Features
 
-- **🎯 Bleskový výřez ROI (300x300 px / Fast Edit Mode)**:
-  - Přepínání jedním kliknutím mezi celým snímkem a **výřezem kolem Slunce** (300x300, 450x450, 600x600 px).
-  - V režimu výřezu probíhá složení a veškeré úpravy v reálném čase (**odezva pod 30 ms**).
-  - Tlačítko **`☀️ Najít Slunce`** nebo kliknutí myší na obrazovku okamžitě vycentruje výřez na zatmění.
-  - Při exportu se automaticky spočítá a uloží **100% plné rozlišení v 16-bitové hloubce**.
-- **Automatické rozpoznání EV a expozičních časů**:
-  - Automatické vyčtení expozičních časů, ISO a clony z **EXIF** metadat.
-  - Inteligentní analýza jasu scény: Pokud EXIF chybí, aplikace analyzuje histogram a seřadí snímky od nejkratší expozice (-EV) po nejdelší (+EV).
-  - Možnost definovat krok (např. **9 snímků po 1.0 EV**).
-- **Zarovnání a detekce černého disku Měsíce**:
-  - 🌑 **Detekce černého disku Měsíce v záři korony**: Hledá kruhový černý disk Měsíce obklopený světlem korony s filtrem na geometrickou cirkularitu.
-  - 🛠️ **Interaktivní ruční dozarovnání fotku po fotce**:
-    - Režim **Rozdíl hran (Difference)**, **50% průhledné překrytí (Blend)** i **Blikání (Flicker)**.
-    - Možnost posouvat každý snímek po 0.5px / 1px / 5px šipkami na klávesnici i tlačítky na obrazovce.
-- **Skládací algoritmy (HDR & Fusion Engines)**:
-  - **Mertens Exposure Fusion** (*Doporučeno pro zatmění Slunce*): Laplaceova pyramidová bezešvá fúze s potlačením šumu.
-  - **Debevec 32-bit HDR** s kalibrací křivky odezvy snímače (CRF) a tonemappingem (Reinhard, Drago, Mantiuk).
+- **🎯 Lightning-fast ROI Crop (300x300 px / Fast Edit Mode)**:
+  - Toggle between the full image and a **crop around the Sun** (300x300, 450x450, 600x600 px) with a single click.
+  - In ROI mode, stacking and all adjustments happen in real-time (**response under 30 ms**).
+  - The **`☀️ Najít`** (Find) button or clicking on the image immediately centers the crop on the eclipse.
+  - During export, the full scene is automatically processed and saved in **100% resolution at 16-bit depth**.
+- **Automatic EV and Exposure Time Detection**:
+  - Automatically extracts shutter speeds, ISO, and aperture from **EXIF** metadata.
+  - Intelligent scene brightness analysis: If EXIF is missing, the app analyzes the histogram and sorts the images from the shortest exposure (-EV) to the longest (+EV).
+  - Option to define custom EV steps (e.g., **9 images with a 1.0 EV step**).
+- **Alignment and Black Moon Disk Detection**:
+  - 🌒 **Moon disk detection in the corona**: Finds the circular black moon disk surrounded by coronal light using a geometric circularity filter.
+  - 🛠 **Interactive manual alignment frame by frame**:
+    - **Edge Difference**, **50% Blend**, and **Flicker** modes for precise alignment.
+    - Easily nudge each frame by 0.2px / 1px / 5px using keyboard arrows or on-screen buttons.
+    - Ability to exclude specific frames directly from the alignment window.
+- **Stacking Algorithms (HDR & Fusion Engines)**:
+  - **Mertens Exposure Fusion** (*Recommended for Solar Eclipses*): Seamless Laplacian pyramid fusion with built-in noise suppression.
+  - **Debevec 32-bit HDR** with Camera Response Function (CRF) calibration and tonemapping (Reinhard, Drago, Mantiuk). Highly optimized CRF estimation prevents OOM crashes on large 24MP brackets.
   - **Robertson 32-bit HDR**.
-- **Potlačení šumu & Filtr sluneční korony**:
-  - 🛡️ **Redukce šumu (Grain filter)**: Adaptivní bilaterální vyhlazení šumu senzoru bez rozmazání jemných struktur korony.
-  - ☀️ **Eclipse Coronal Detail Filter**: Zvýraznění jemných magnetických siločar ve vnější i vnitřní koroně se striktní ochranou tmavého nebe.
+- **Noise Reduction & Solar Corona Filter**:
+  - 🧹 **Noise Reduction (Grain filter)**: Adaptive bilateral sensor noise smoothing without blurring fine coronal structures.
+  - 🌟 **Eclipse Coronal Detail Filter**: Enhances fine magnetic field lines in the inner and outer corona while strictly protecting the dark sky background.
 - **Export**:
-  - **16-bit TIFF** (ideální pro další postprocessing v PixInsight, Photoshopu či Lightroomu).
-  - **PNG**, **100% JPG** a **32-bit Radiance HDR**.
+  - **16-bit TIFF** (ideal for further post-processing in PixInsight, Photoshop, or Lightroom).
+  - **PNG**, **100% JPG**, and **32-bit Radiance HDR**.
 
 ---
 
-## 🚀 Instalace a spuštění
+## 🛠 Installation and Usage
 
-### 1. Požadavky
-- Python 3.10+ (např. Python 3.13)
-- Nainstalované knihovny:
+### 1. Requirements
+- Python 3.10+ (e.g., Python 3.13)
+- Required libraries:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Spuštění aplikace
+### 2. Running the application
 ```bash
 python main.py
 ```
-nebo
+or
 ```bash
 py main.py
 ```
 
 ---
 
-## 📸 Jak používat aplikaci
+## 📖 How to use the application
 
-1. **Načtení snímků**:
-   - Přetáhněte (Drag & Drop) soubory (např. 9 JPG snímků zatmění) přímo do okna aplikace nebo klikněte na **`+ Přidat fotky`**.
-2. **Blesková práce ve výřezu (Fast ROI)**:
-   - Klikněte nahoře na **`🎯 Rychlý výřez (ROI 300px)`** a **`☀️ Najít Slunce`** (nebo klikněte myší kamkoliv na Slunce).
-   - Složení i veškeré posuvníky reagují **okamžitě bez jakéhokoliv čekání**.
-3. **Přepnutí na celý snímek / Export**:
-   - Vypnutím tlačítka výřezu se vrátíte na celý snímek.
-   - Klikněte na **`💾 Exportovat v plné kvalitě`** a uložte výsledný 16-bit TIFF nebo JPG.
+1. **Load images**:
+   - Drag & Drop files (e.g., 9 JPG eclipse brackets) directly into the app window, or click **`+ Přidat fotky`** (Add photos).
+2. **Lightning-fast editing (Fast ROI)**:
+   - Click **`🎯 ROI`** in the top bar and **`☀️ Najít`** (Find) (or just click on the Sun in the image).
+   - Stacking and all sliders will respond **instantly without any waiting**.
+3. **Full scene view / Export**:
+   - Toggle the ROI button off to view the full scene.
+   - Click **`💾 Export`** to save the final 16-bit TIFF or JPG.

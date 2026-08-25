@@ -28,6 +28,10 @@ class InteractiveImageViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+        # Original full image dimensions for consistent coordinate space
+        self._orig_w: int = 0
+        self._orig_h: int = 0
+
         # Base full scene image
         self._base_image_rgb: Optional[np.ndarray] = None
         self._base_pixmap: Optional[QPixmap] = None
@@ -57,6 +61,10 @@ class InteractiveImageViewer(QWidget):
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        
+    def set_original_size(self, w: int, h: int):
+        self._orig_w = w
+        self._orig_h = h
 
     # ------------------ Base Scene Image ------------------
     def set_base_image_bgr_float(self, img_bgr_f32: np.ndarray, keep_view: bool = True):
@@ -71,12 +79,16 @@ class InteractiveImageViewer(QWidget):
         h, w, ch = self._base_image_rgb.shape
         bytes_per_line = ch * w
         
+        # If original size not set, assume this is the full size
+        if self._orig_w == 0 or self._orig_h == 0:
+            self._orig_w, self._orig_h = w, h
+            
         qimg = QImage(self._base_image_rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
         self._base_pixmap = QPixmap.fromImage(qimg)
 
         # If ROI is enabled and not yet set, place default at center
-        if self._roi_rect is None and w > 50 and h > 50:
-            self.set_roi_center(w // 2, h // 2, emit_signal=False)
+        if self._roi_rect is None and self._orig_w > 50 and self._orig_h > 50:
+            self.set_roi_center(self._orig_w // 2, self._orig_h // 2, emit_signal=False)
 
         if not keep_view or self._needs_fit:
             self.fit_to_window()
@@ -95,6 +107,8 @@ class InteractiveImageViewer(QWidget):
         self._roi_enabled = enabled
         if enabled:
             self.setCursor(Qt.CursorShape.CrossCursor)
+            if self._roi_rect is None and self._orig_w > 50 and self._orig_h > 50:
+                self.set_roi_center(self._orig_w // 2, self._orig_h // 2, emit_signal=False)
         else:
             self.setCursor(Qt.CursorShape.ArrowCursor)
             self._roi_crop_pixmap = None
@@ -111,7 +125,9 @@ class InteractiveImageViewer(QWidget):
         """Centers the ROI box on (cx, cy) in base image coordinates."""
         if self._base_image_rgb is None:
             return
-        h, w = self._base_image_rgb.shape[:2]
+        w = self._orig_w if self._orig_w > 0 else self._base_image_rgb.shape[1]
+        h = self._orig_h if self._orig_h > 0 else self._base_image_rgb.shape[0]
+        
         half = self._roi_size // 2
         x0 = max(0, min(w - self._roi_size, cx - half))
         y0 = max(0, min(h - self._roi_size, cy - half))
@@ -192,7 +208,8 @@ class InteractiveImageViewer(QWidget):
             return
         
         vw, vh = self.width(), self.height()
-        iw, ih = self._base_pixmap.width(), self._base_pixmap.height()
+        iw = self._orig_w if self._orig_w > 0 else self._base_pixmap.width()
+        ih = self._orig_h if self._orig_h > 0 else self._base_pixmap.height()
         
         if iw <= 0 or ih <= 0 or vw <= 20 or vh <= 20:
             self._needs_fit = True
@@ -214,7 +231,8 @@ class InteractiveImageViewer(QWidget):
         if self._base_pixmap is None or self._base_pixmap.isNull():
             return
         vw, vh = self.width(), self.height()
-        iw, ih = self._base_pixmap.width(), self._base_pixmap.height()
+        iw = self._orig_w if self._orig_w > 0 else self._base_pixmap.width()
+        ih = self._orig_h if self._orig_h > 0 else self._base_pixmap.height()
         self._zoom = 1.0
         self._pan_pos = QPointF((vw - iw) / 2.0, (vh - ih) / 2.0)
         self._needs_fit = False
@@ -234,8 +252,8 @@ class InteractiveImageViewer(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, text)
             return
 
-        iw = self._base_pixmap.width() * self._zoom
-        ih = self._base_pixmap.height() * self._zoom
+        iw = self._orig_w * self._zoom if self._orig_w > 0 else self._base_pixmap.width() * self._zoom
+        ih = self._orig_h * self._zoom if self._orig_h > 0 else self._base_pixmap.height() * self._zoom
         dest_rect = QRectF(self._pan_pos.x(), self._pan_pos.y(), iw, ih)
 
         # 1. Base image rendering
@@ -314,7 +332,8 @@ class InteractiveImageViewer(QWidget):
             return None
         img_x = int((pos.x() - self._pan_pos.x()) / self._zoom)
         img_y = int((pos.y() - self._pan_pos.y()) / self._zoom)
-        h, w = self._base_image_rgb.shape[:2]
+        w = self._orig_w if self._orig_w > 0 else self._base_image_rgb.shape[1]
+        h = self._orig_h if self._orig_h > 0 else self._base_image_rgb.shape[0]
         if 0 <= img_x < w and 0 <= img_y < h:
             return img_x, img_y
         return None
@@ -374,7 +393,19 @@ class InteractiveImageViewer(QWidget):
         coords = self._screen_to_image_coords(pos)
         if coords is not None and self._base_image_rgb is not None:
             img_x, img_y = coords
-            r, g, b = self._base_image_rgb[img_y, img_x]
+            
+            w = self._orig_w if self._orig_w > 0 else self._base_image_rgb.shape[1]
+            h = self._orig_h if self._orig_h > 0 else self._base_image_rgb.shape[0]
+            act_h, act_w = self._base_image_rgb.shape[:2]
+            
+            # Map original coordinate space down to current array's actual size
+            read_x = int(img_x * (act_w / w)) if w > 0 else img_x
+            read_y = int(img_y * (act_h / h)) if h > 0 else img_y
+            
+            read_x = max(0, min(act_w - 1, read_x))
+            read_y = max(0, min(act_h - 1, read_y))
+            
+            r, g, b = self._base_image_rgb[read_y, read_x]
             self.pixel_hovered.emit(img_x, img_y, int(r), int(g), int(b))
 
     def mouseReleaseEvent(self, event: QMouseEvent):
@@ -412,6 +443,7 @@ class ImageViewerContainer(QWidget):
         # Top toolbar
         top_bar = QHBoxLayout()
         top_bar.setContentsMargins(8, 4, 8, 4)
+        top_bar.setSpacing(4)
         
         self.lbl_info = QLabel("Připraveno")
         self.lbl_info.setStyleSheet("color: #8c9ba5; font-size: 11px;")
@@ -419,7 +451,7 @@ class ImageViewerContainer(QWidget):
         top_bar.addStretch()
 
         # ROI Mode Selector
-        self.btn_roi_toggle = QPushButton("🎯 Rychlý výřez Slunce (ROI)")
+        self.btn_roi_toggle = QPushButton("🎯 ROI")
         self.btn_roi_toggle.setCheckable(True)
         self.btn_roi_toggle.setFixedHeight(28)
         self.btn_roi_toggle.setToolTip("Aktivuje rychlý výřez pro bleskovou editaci. Po zapnutí stačí kliknout myší do fotky, kde se nachází Slunce!")
@@ -427,35 +459,35 @@ class ImageViewerContainer(QWidget):
         top_bar.addWidget(self.btn_roi_toggle)
 
         self.combo_roi_size = QComboBox()
-        self.combo_roi_size.addItem("300x300 px (Bleskové ⚡)", 300)
-        self.combo_roi_size.addItem("450x450 px", 450)
-        self.combo_roi_size.addItem("600x600 px", 600)
-        self.combo_roi_size.addItem("800x800 px", 800)
+        self.combo_roi_size.addItem("300x300", 300)
+        self.combo_roi_size.addItem("450x450", 450)
+        self.combo_roi_size.addItem("600x600", 600)
+        self.combo_roi_size.addItem("800x800", 800)
         self.combo_roi_size.setFixedHeight(28)
         self.combo_roi_size.setVisible(False)
         self.combo_roi_size.currentIndexChanged.connect(self._on_roi_size_changed)
         top_bar.addWidget(self.combo_roi_size)
 
-        self.btn_find_sun = QPushButton("☀️ Najít Slunce")
+        self.btn_find_sun = QPushButton("☀️ Najít")
         self.btn_find_sun.setFixedHeight(28)
         self.btn_find_sun.setVisible(False)
         self.btn_find_sun.setToolTip("Automaticky detekuje polohu Slunce / disku Měsíce a umístí na něj výřez.")
         self.btn_find_sun.clicked.connect(self.center_sun_requested.emit)
         top_bar.addWidget(self.btn_find_sun)
 
-        self.btn_zoom_roi = QPushButton("🔍 Zaměřit výřez")
+        self.btn_zoom_roi = QPushButton("🔍 Přiblížit")
         self.btn_zoom_roi.setFixedHeight(28)
         self.btn_zoom_roi.setVisible(False)
         self.btn_zoom_roi.setToolTip("Přiblíží a vycentruje pohled přímo na vybraný výřez.")
         self.btn_zoom_roi.clicked.connect(self._on_zoom_roi)
         top_bar.addWidget(self.btn_zoom_roi)
 
-        self.btn_fit = QPushButton("Přizpůsobit oknu")
+        self.btn_fit = QPushButton("Přizpůsobit")
         self.btn_fit.setFixedHeight(28)
         self.btn_fit.clicked.connect(self._on_fit)
         top_bar.addWidget(self.btn_fit)
 
-        self.btn_100 = QPushButton("100% (1:1)")
+        self.btn_100 = QPushButton("1:1")
         self.btn_100.setFixedHeight(28)
         self.btn_100.clicked.connect(self._on_100)
         top_bar.addWidget(self.btn_100)
@@ -469,7 +501,7 @@ class ImageViewerContainer(QWidget):
         self.split_slider = QSlider(Qt.Orientation.Horizontal)
         self.split_slider.setRange(0, 100)
         self.split_slider.setValue(50)
-        self.split_slider.setFixedWidth(100)
+        self.split_slider.setFixedWidth(80)
         self.split_slider.setVisible(False)
         self.split_slider.valueChanged.connect(self._on_split_slider)
         top_bar.addWidget(self.split_slider)

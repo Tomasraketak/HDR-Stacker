@@ -46,7 +46,7 @@ except ImportError:
 class StackingWorker(QThread):
     """Background worker for fast proxy-resolution or ROI crop stacking with thread-safe cancellation."""
     progress = pyqtSignal(int, str)
-    finished_success = pyqtSignal(object, object)  # (base_f32_bgr, hdr_radiance_map_or_None)
+    finished_success = pyqtSignal(object, object, int, int)  # (base_f32_bgr, hdr_radiance_map_or_None, orig_w, orig_h)
     failed = pyqtSignal(str)
 
     def __init__(
@@ -167,7 +167,23 @@ class StackingWorker(QThread):
                 return
 
             self.progress.emit(100, "Složení dokončeno.")
-            self.finished_success.emit(base_merged, hdr_radiance)
+            
+            # Find original size
+            orig_h, orig_w = images[0].shape[:2]
+            if not self.roi_rect:
+                orig_h, orig_w = int(orig_h / effective_scale), int(orig_w / effective_scale)
+            else:
+                # If we cropped, original size is the full image size before crop.
+                # We can re-read the first image to get the exact size, but it was already used.
+                # Actually it's easier to just read shape from items if we have it, or re-read header.
+                pass
+            
+            # To be 100% sure, let's just get the full resolution from the first file
+            # it takes 1 ms using cv2 header or imdecode.
+            tmp = cv2.imdecode(np.fromfile(self.items[0].filepath, dtype=np.uint8), cv2.IMREAD_COLOR)
+            orig_h, orig_w = tmp.shape[:2]
+
+            self.finished_success.emit(base_merged, hdr_radiance, orig_w, orig_h)
 
         except Exception as e:
             if not self.isInterruptionRequested():
@@ -436,6 +452,11 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("Zobrazen celý snímek. Provádím složení plné scény...")
             self.start_stacking()
 
+    def _on_manual_shifts_applied(self):
+        self.lbl_status.setText("Manuální posuny uloženy. Spouštím složení...")
+        self.exposure_list.refresh_table()
+        self.start_stacking()
+
     def _center_roi_on_sun(self):
         active_items = self.exposure_list.get_active_items()
         if not active_items:
@@ -500,10 +521,13 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(pct)
         self.lbl_status.setText(msg)
 
-    def _on_stacking_success(self, base_bgr: np.ndarray, hdr_radiance: Optional[np.ndarray]):
+    def _on_stacking_success(self, base_bgr: np.ndarray, hdr_radiance: Optional[np.ndarray], orig_w: int, orig_h: int):
         self.controls.btn_stack.setEnabled(True)
         self.controls.btn_export.setEnabled(True)
         self.progress_bar.setVisible(False)
+        
+        # Ensure the viewer knows the original dimensions so ROI coords are correct
+        self.viewer_container.viewer.set_original_size(orig_w, orig_h)
         
         self._base_merged_bgr = base_bgr
         self._hdr_radiance_map = hdr_radiance

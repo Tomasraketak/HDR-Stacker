@@ -32,6 +32,7 @@ QGroupBox::title {
     padding: 0 6px;
     background-color: #21252f;
     border-radius: 4px;
+    font-size: 13px;
 }
 
 QPushButton {
