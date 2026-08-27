@@ -40,7 +40,7 @@ class SliderRow(QWidget):
 
         self.lbl_title = QLabel(label)
         self.lbl_title.setObjectName("SliderLabel")
-        self.lbl_title.setMinimumWidth(126)
+        self.lbl_title.setMinimumWidth(112)
         layout.addWidget(self.lbl_title)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
@@ -100,7 +100,7 @@ class ControlsPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(300)
         self._loading_preset = False
         self._init_ui()
 
@@ -114,7 +114,7 @@ class ControlsPanel(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         content = QWidget()
         layout = QVBoxLayout(content)

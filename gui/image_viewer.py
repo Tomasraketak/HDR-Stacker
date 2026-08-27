@@ -84,7 +84,7 @@ class InteractiveImageViewer(QWidget):
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setMinimumSize(320, 240)
+        self.setMinimumSize(260, 200)
 
     # ------------------------------------------------------------ Scene image
 

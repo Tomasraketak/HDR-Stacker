@@ -36,7 +36,7 @@ class ExposureListWidget(QWidget):
         self.items: List[ExposureItem] = []
         # Below this the filename column collapses to an ellipsis and the list
         # stops being useful for picking frames.
-        self.setMinimumWidth(300)
+        self.setMinimumWidth(250)
         self._init_ui()
 
     def _init_ui(self):

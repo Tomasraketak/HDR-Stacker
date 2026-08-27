@@ -36,6 +36,7 @@ try:
     from gui.controls_panel import ControlsPanel
     from gui.manual_align_dialog import ManualAlignDialog
     from gui.styles import DARK_THEME
+    from gui.ui_utils import fit_window_to_screen
 except ImportError:  # pragma: no cover
     from ..core.exif_and_analysis import ExposureItem, estimate_stack_megapixels
     from ..core.aligner import calculate_moon_shifts, apply_shifts_to_images, find_sun_or_moon_center
@@ -47,6 +48,7 @@ except ImportError:  # pragma: no cover
     from .controls_panel import ControlsPanel
     from .manual_align_dialog import ManualAlignDialog
     from .styles import DARK_THEME
+    from .ui_utils import fit_window_to_screen
 
 SUPPORTED_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp', '.webp')
 
@@ -416,8 +418,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Astro HDR Stacker — Skládání expozic & Zatmění Slunce")
-        self.resize(1440, 900)
-        self.setMinimumSize(1024, 680)
+        # A hard minimum this large cannot be honoured on a 1280x688 desktop
+        # (a 15" 1080p laptop at 150 % scaling), so keep it genuinely small and
+        # let the panels scroll instead.
+        self.setMinimumSize(900, 560)
         self.setAcceptDrops(True)
         self.setStyleSheet(DARK_THEME)
 
@@ -444,6 +448,7 @@ class MainWindow(QMainWindow):
 
         self._init_ui()
         self._init_shortcuts()
+        fit_window_to_screen(self, 1440, 900)
 
     # --------------------------------------------------------------------- UI
 

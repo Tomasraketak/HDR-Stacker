@@ -107,6 +107,7 @@ Náhled je záměrně zmenšený kvůli rychlosti — na kvalitu exportu to nem�
 | Disk Měsíce se nenajde | Použijte **🛠️ Ruční dozarovnání** a posuňte snímky ručně podle rozdílového náhledu. |
 | Export se nepodaří zapsat | Zkontrolujte, že soubor není otevřený v jiném programu a že do složky lze zapisovat. |
 | Chyba při instalaci PyQt6 | Použijte Python 3.12 místo 3.13+. |
+| Okno se nevejde na obrazovku | Okna se sama zmenší podle plochy monitoru. Ovládací panely lze rolovat, takže tlačítka dole zůstanou vždy dosažitelná. |
 
 Pokud dojde k neočekávané chybě, aplikace ji zobrazí v dialogu (včetně technického
 výpisu pod tlačítkem *Show Details*) a **běží dál** — rozpracovaná práce se neztratí.

@@ -18,7 +18,8 @@ from PyQt6.QtGui import QKeyEvent, QShowEvent, QCloseEvent
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QComboBox, QDoubleSpinBox, QGroupBox, QRadioButton, QButtonGroup,
-    QMessageBox, QSplitter, QWidget, QCheckBox, QProgressBar
+    QMessageBox, QSplitter, QWidget, QCheckBox, QProgressBar,
+    QScrollArea, QFrame, QSizePolicy
 )
 
 try:
@@ -26,11 +27,13 @@ try:
     from core.aligner import detect_black_circle_in_light, calculate_moon_shifts
     from core.image_cache import GLOBAL_IMAGE_CACHE
     from gui.image_viewer import InteractiveImageViewer
+    from gui.ui_utils import fit_window_to_screen, center_on_screen
 except ImportError:  # pragma: no cover
     from ..core.exif_and_analysis import ExposureItem
     from ..core.aligner import detect_black_circle_in_light, calculate_moon_shifts
     from ..core.image_cache import GLOBAL_IMAGE_CACHE
     from .image_viewer import InteractiveImageViewer
+    from .ui_utils import fit_window_to_screen, center_on_screen
 
 # Frames are compared at this size: large enough for confident subpixel work,
 # small enough that a whole bracket fits comfortably in memory.
@@ -122,8 +125,8 @@ class ManualAlignDialog(QDialog):
     def __init__(self, items: List[ExposureItem], parent=None):
         super().__init__(parent)
         self.setWindowTitle("🛠️ Manuální a asistované zarovnání snímků zatmění")
-        self.resize(1320, 860)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setSizeGripEnabled(True)
 
         self.items = items
         self.ref_idx = len(items) // 2
@@ -146,6 +149,10 @@ class ManualAlignDialog(QDialog):
         self._flicker_timer.timeout.connect(self._on_flicker_tick)
 
         self._init_ui()
+        # Fit to the usable desktop rather than a fixed 1320x860: on a 15" laptop
+        # at 125 % scaling that height puts the action buttons off-screen.
+        fit_window_to_screen(self, 1320, 860)
+        center_on_screen(self)
 
     # ------------------------------------------------------------------ Build
 
@@ -156,15 +163,29 @@ class ManualAlignDialog(QDialog):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._build_left_panel())
+
+        # Scrolling the controls means the dialog can be made short without the
+        # bottom button row ever being pushed out of reach.
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        left_scroll.setWidget(self._build_left_panel())
+        left_scroll.setMinimumWidth(330)
+        splitter.addWidget(left_scroll)
         splitter.addWidget(self._build_viewer_panel())
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 7)
         splitter.setSizes([360, 900])
         main_layout.addWidget(splitter, 1)
 
-        bottom = QHBoxLayout()
+        action_bar = QFrame()
+        action_bar.setObjectName("StatusStrip")
+        action_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        bottom = QHBoxLayout(action_bar)
+        bottom.setContentsMargins(10, 6, 10, 6)
         self.lbl_status = QLabel("Zarovnejte snímky tak, aby hrany disku na sebe seděly.")
+        self.lbl_status.setWordWrap(False)
         self.lbl_status.setObjectName("StatusLabel")
         bottom.addWidget(self.lbl_status, 1)
 
@@ -183,7 +204,7 @@ class ManualAlignDialog(QDialog):
         self.btn_apply.clicked.connect(self._on_apply)
         bottom.addWidget(self.btn_apply)
 
-        main_layout.addLayout(bottom)
+        main_layout.addWidget(action_bar, 0)
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
@@ -244,12 +265,13 @@ class ManualAlignDialog(QDialog):
         nudge_layout = QVBoxLayout(nudge_group)
 
         spin_row = QHBoxLayout()
+        spin_row.setSpacing(4)
         spin_row.addWidget(QLabel("Δ X:"))
         self.spin_dx = self._make_shift_spin(self.items[self.current_idx].shift_x)
-        spin_row.addWidget(self.spin_dx)
+        spin_row.addWidget(self.spin_dx, 1)
         spin_row.addWidget(QLabel("Δ Y:"))
         self.spin_dy = self._make_shift_spin(self.items[self.current_idx].shift_y)
-        spin_row.addWidget(self.spin_dy)
+        spin_row.addWidget(self.spin_dy, 1)
         nudge_layout.addLayout(spin_row)
 
         step_row = QHBoxLayout()
@@ -318,6 +340,7 @@ class ManualAlignDialog(QDialog):
         spin.setSingleStep(0.5)
         spin.setDecimals(1)
         spin.setSuffix(" px")
+        spin.setMinimumWidth(84)
         spin.setValue(value)
         spin.valueChanged.connect(self._on_spin_changed)
         return spin

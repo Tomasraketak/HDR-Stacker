@@ -469,6 +469,40 @@ def test_gui(paths):
     check(dialog._loader is None or not dialog._loader.isRunning(),
           "closing the dialog must stop its loader thread")
 
+    # (f2) Window geometry must fit real laptop desktops. A 15" 1080p panel at
+    #      Windows' default 125 % scaling leaves about 1536x826 usable; anything
+    #      taller opens with its action buttons below the screen edge.
+    LAPTOP_DESKTOPS = [
+        ("1920x1080 @100%", 1920, 1032),
+        ("1920x1080 @125%", 1536, 826),
+        ("1920x1080 @150%", 1280, 688),
+        ("1600x900 @100%", 1600, 852),
+        ("1366x768 @100%", 1366, 728),
+    ]
+    win_min = window.minimumSizeHint()
+    dlg = ManualAlignDialog(window.exposure_list.get_active_items(), parent=window)
+    dlg_min = dlg.minimumSizeHint()
+    for label, dw, dh in LAPTOP_DESKTOPS:
+        check(win_min.width() <= dw and win_min.height() <= dh,
+              f"main window minimum {win_min.width()}x{win_min.height()} must fit {label}")
+        check(dlg_min.width() <= dw and dlg_min.height() <= dh,
+              f"align dialog minimum {dlg_min.width()}x{dlg_min.height()} must fit {label}")
+    print(f"   minimums: window {win_min.width()}x{win_min.height()}, "
+          f"dialog {dlg_min.width()}x{dlg_min.height()} — fit all 5 laptop desktops")
+
+    # The Apply button must stay inside the dialog even when squeezed hard.
+    dlg.resize(900, 480)
+    QCoreApplication.processEvents()
+    btn = dlg.btn_apply
+    bottom_right = btn.mapTo(dlg, btn.rect().bottomRight())
+    top_left = btn.mapTo(dlg, btn.rect().topLeft())
+    check(0 <= top_left.x() and 0 <= top_left.y()
+          and bottom_right.x() <= dlg.width() and bottom_right.y() <= dlg.height(),
+          f"Apply button must stay on-screen when the dialog is squeezed "
+          f"(button at {top_left.x()},{top_left.y()}-{bottom_right.x()},{bottom_right.y()} "
+          f"in a {dlg.width()}x{dlg.height()} dialog)")
+    dlg.reject()
+
     # (g) End-to-end export through the real worker, including alignment,
     #     fusion, post-processing and the 16-bit write.
     from gui.main_window import FullResExportWorker
