@@ -1,67 +1,170 @@
 # 🌞 Astro HDR Stacker — Solar Eclipse & Exposure Fusion Studio
 
-A professional desktop application in Python (PyQt6 + OpenCV) for stacking exposure brackets into a single High Dynamic Range (HDR) image. Designed specifically for demanding astrophotography scenes such as **Total Solar Eclipses**, the solar corona, prominences, as well as classic landscape HDR photography.
+A desktop application in Python (PyQt6 + OpenCV) for stacking exposure brackets into a single
+High Dynamic Range image. Built for total solar eclipses — the corona, prominences and the
+diamond ring — as well as ordinary landscape HDR.
 
 ---
 
-## 🚀 Key Features
+## 🚀 Rychlý start (Windows 10 / 11)
 
-- **🎯 Lightning-fast ROI Crop (300x300 px / Fast Edit Mode)**:
-  - Toggle between the full image and a **crop around the Sun** (300x300, 450x450, 600x600 px) with a single click.
-  - In ROI mode, stacking and all adjustments happen in real-time (**response under 30 ms**).
-  - The **`☀️ Najít`** (Find) button or clicking on the image immediately centers the crop on the eclipse.
-  - During export, the full scene is automatically processed and saved in **100% resolution at 16-bit depth**.
-- **Automatic EV and Exposure Time Detection**:
-  - Automatically extracts shutter speeds, ISO, and aperture from **EXIF** metadata.
-  - Intelligent scene brightness analysis: If EXIF is missing, the app analyzes the histogram and sorts the images from the shortest exposure (-EV) to the longest (+EV).
-  - Option to define custom EV steps (e.g., **9 images with a 1.0 EV step**).
-- **Alignment and Black Moon Disk Detection**:
-  - 🌒 **Moon disk detection in the corona**: Finds the circular black moon disk surrounded by coronal light using a geometric circularity filter.
-  - 🛠 **Interactive manual alignment frame by frame**:
-    - **Edge Difference**, **50% Blend**, and **Flicker** modes for precise alignment.
-    - Easily nudge each frame by 0.2px / 1px / 5px using keyboard arrows or on-screen buttons.
-    - Ability to exclude specific frames directly from the alignment window.
-- **Stacking Algorithms (HDR & Fusion Engines)**:
-  - **Mertens Exposure Fusion** (*Recommended for Solar Eclipses*): Seamless Laplacian pyramid fusion with built-in noise suppression.
-  - **Debevec 32-bit HDR** with Camera Response Function (CRF) calibration and tonemapping (Reinhard, Drago, Mantiuk). Highly optimized CRF estimation prevents OOM crashes on large 24MP brackets.
-  - **Robertson 32-bit HDR**.
-- **Noise Reduction & Solar Corona Filter**:
-  - 🧹 **Noise Reduction (Grain filter)**: Adaptive bilateral sensor noise smoothing without blurring fine coronal structures.
-  - 🌟 **Eclipse Coronal Detail Filter**: Enhances fine magnetic field lines in the inner and outer corona while strictly protecting the dark sky background.
-- **Export**:
-  - **16-bit TIFF** (ideal for further post-processing in PixInsight, Photoshop, or Lightroom).
-  - **PNG**, **100% JPG**, and **32-bit Radiance HDR**.
+**Nejrychlejší cesta — stačí dvakrát kliknout:**
 
----
+1. Nainstalujte **Python 3.10 – 3.12** z [python.org](https://www.python.org/downloads/windows/).
+   Při instalaci **zaškrtněte „Add Python to PATH“**.
+2. Ve složce s programem poklepejte na **`run.bat`**.
 
-## 🛠 Installation and Usage
+`run.bat` při prvním spuštění sám vytvoří virtuální prostředí, doinstaluje knihovny
+a spustí aplikaci. Při dalších spuštěních už jen spustí aplikaci (během pár sekund).
 
-### 1. Requirements
-- Python 3.10+ (e.g., Python 3.13)
-- Required libraries:
+**Ruční cesta (PowerShell nebo Příkazový řádek):**
 
-```bash
+```powershell
+cd C:\cesta\k\HDR-Stacker
+py -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-### 2. Running the application
-```bash
 python main.py
 ```
-or
+
+**macOS / Linux:**
+
 ```bash
-py main.py
+cd /cesta/k/HDR-Stacker
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 main.py
 ```
+
+> **Poznámka k Pythonu 3.13+:** PyQt6 a OpenCV pro něj nemusí mít připravené instalační
+> balíčky. Pokud instalace skončí chybou o „building wheel“, použijte Python 3.12.
 
 ---
 
-## 📖 How to use the application
+## 📖 Jak program používat
 
-1. **Load images**:
-   - Drag & Drop files (e.g., 9 JPG eclipse brackets) directly into the app window, or click **`+ Přidat fotky`** (Add photos).
-2. **Lightning-fast editing (Fast ROI)**:
-   - Click **`🎯 ROI`** in the top bar and **`☀️ Najít`** (Find) (or just click on the Sun in the image).
-   - Stacking and all sliders will respond **instantly without any waiting**.
-3. **Full scene view / Export**:
-   - Toggle the ROI button off to view the full scene.
-   - Click **`💾 Export`** to save the final 16-bit TIFF or JPG.
+### 1. Načtěte expoziční řadu
+Přetáhněte fotky (např. 9 JPEG snímků zatmění) přímo do okna aplikace, nebo klikněte na
+**`+ Přidat fotky`** (`Ctrl+O`). Program sám přečte časy závěrky z EXIF, seřadí snímky od
+nejtmavšího po nejsvětlejší a spočítá EV. Když EXIF chybí, seřadí je podle jasu scény
+a EV odhadne z kroku, který nastavíte v poli **Krok expozice**.
+
+Snímek můžete kdykoliv vyřadit odškrtnutím políčka v prvním sloupci seznamu.
+
+### 2. Zarovnejte snímky
+- **`🌑 Detekce černého disku Měsíce`** (výchozí) najde kruhový černý disk Měsíce v záři
+  korony a zarovná snímky subpixelově. Krajina a stromy jsou odfiltrovány testem kruhovosti.
+- **`🚫 Bez zarovnání`** použijte, pokud jste fotili z pevného stativu.
+- **`🛠️ Ruční dozarovnání`** (`Ctrl+M`) otevře okno pro doladění snímek po snímku:
+  - Režim **Rozdíl hran** — nesedící hrany svítí barevně, sedící zmizí. Nejpřesnější.
+  - Režim **Blend** a **Blikání** pro rychlou kontrolu.
+  - Posun šipkami na klávesnici; **Shift** = hrubý krok 5 px, **Ctrl** = jemný krok 0,2 px.
+  - Tlačítko **`🌑 Najít černý disk Měsíce`** předvyplní posuny automaticky.
+  - **Zrušit** vrátí všechny posuny do stavu před otevřením okna.
+
+### 3. Pracujte v režimu výřezu (nejrychlejší způsob editace)
+Klikněte na **`🎯 ROI`** v horní liště a pak na **`☀️ Najít`** — nebo prostě klikněte
+myší do fotky tam, kde je Slunce. Skládá se jen výřez kolem koróny (300×300 až 1200×1200 px),
+takže každá změna posuvníku je vidět prakticky okamžitě. Výřez můžete kdykoliv přetáhnout myší.
+
+### 4. Vylaďte výsledek
+V panelu vpravo:
+- **Metoda HDR** — pro zatmění nechte **Mertens Exposure Fusion**. Nepotřebuje znát
+  expoziční časy a dává nejčistší korónu. **Debevec** a **Robertson** počítají skutečnou
+  32bitovou mapu jasu, ale vyžadují správné časy závěrky z EXIF.
+- **Předvolby** (Vnitřní korona, Vnější korona, Diamantový prsten, Krajina se zatměním)
+  nastaví všechny posuvníky najednou jako rozumný výchozí bod.
+- **Detaily korony** zvýrazní jemné struktury magnetického pole. Tmavá obloha je přitom
+  chráněná, takže se nezvýrazňuje šum.
+- Dvojklikem na jakýkoliv posuvník ho vrátíte na výchozí hodnotu.
+
+### 5. Exportujte
+**`💾 Exportovat`** (`Ctrl+S`) spočítá výsledek znovu z originálů v plném rozlišení
+a uloží ho jako **16bitový TIFF**, **JPEG**, **16bitový PNG** nebo **32bitový Radiance HDR**.
+Náhled je záměrně zmenšený kvůli rychlosti — na kvalitu exportu to nemá vliv.
+
+### Klávesové zkratky
+
+| Zkratka | Akce |
+|---|---|
+| `Ctrl+O` | Přidat fotky |
+| `Ctrl+R` | Složit snímky |
+| `Ctrl+S` | Exportovat v plné kvalitě |
+| `Ctrl+M` | Ruční dozarovnání |
+| `Ctrl+0` / `Ctrl+1` | Přizpůsobit oknu / zobrazit 1:1 |
+| Kolečko myši | Zoom · dvojklik = přizpůsobit |
+
+---
+
+## 🛠 Řešení potíží
+
+| Problém | Řešení |
+|---|---|
+| Aplikace je pomalá nebo se zasekává | Nastavte **Pracovní rychlost** na `🚀 1/8 rozlišení` a používejte režim **🎯 ROI**. |
+| Hlásí nedostatek paměti při exportu | Program sám nabídne export ve zmenšeném rozlišení — potvrďte **Ano**. Pomůže i zavření prohlížeče. |
+| „Všechny snímky mají prakticky stejný expoziční čas“ | Snímky nemají použitelné EXIF časy. Přepněte **Metodu HDR** na **Mertens**, která časy nepotřebuje. |
+| Disk Měsíce se nenajde | Použijte **🛠️ Ruční dozarovnání** a posuňte snímky ručně podle rozdílového náhledu. |
+| Export se nepodaří zapsat | Zkontrolujte, že soubor není otevřený v jiném programu a že do složky lze zapisovat. |
+| Chyba při instalaci PyQt6 | Použijte Python 3.12 místo 3.13+. |
+
+Pokud dojde k neočekávané chybě, aplikace ji zobrazí v dialogu (včetně technického
+výpisu pod tlačítkem *Show Details*) a **běží dál** — rozpracovaná práce se neztratí.
+
+---
+
+## ✨ Key features
+
+- **Fast ROI crop mode** — toggle between the full frame and a 300×300 … 1200×1200 px crop
+  around the Sun for near-instant editing. Click anywhere in the image to recentre it.
+  Exports always run at full resolution regardless of the preview crop.
+- **Automatic EV and exposure detection** — shutter speed, ISO and aperture from EXIF, with
+  a histogram-based fallback that sorts frames from the shortest (-EV) to the longest (+EV)
+  exposure. Manual shifts and exclusions are preserved across re-sorts.
+- **Lunar disc detection and alignment** — finds the circular black moon disc inside the
+  coronal glow using a circularity filter plus a bright-halo check, refined to subpixel
+  accuracy at full resolution. Detection runs on a bounded proxy, so it is fast on 45 MP frames.
+- **Interactive frame-by-frame manual alignment** — edge difference, 50 % blend and flicker
+  modes; frames load on a background thread; Cancel restores the original shifts.
+- **Fusion engines** — Mertens exposure fusion (recommended for eclipses), Debevec and
+  Robertson 32-bit HDR with CRF calibration and Reinhard / Drago / Mantiuk tonemapping.
+- **Noise reduction and coronal detail filter** — edge-preserving bilateral denoising and
+  multi-scale coronal enhancement that is gated off in the dark sky, so grain is never sharpened.
+- **Export** — 16-bit TIFF, 16-bit PNG, quality JPEG and 32-bit Radiance HDR, with
+  Unicode-safe file writing.
+
+## 🧠 Stability and performance notes
+
+The application is built to stay alive on a mid-range laptop:
+
+- **Memory-bounded fusion.** Full-resolution stacks above 12 Mpx are fused in overlapping
+  horizontal bands. On a 9 × 24 Mpx bracket this cuts peak RSS from **6.0 GB to 2.5 GB**
+  at the same speed, and the result matches single-pass fusion to within 3 × 10⁻⁷.
+- **Memory-aware export.** Before a full-resolution export the app estimates the requirement
+  against actual free RAM and offers a safe reduced-scale export rather than being killed.
+- **Debounced re-stacking.** Dragging the ROI used to spawn one background thread per mouse
+  move, each decoding the whole bracket from disk. Requests are now coalesced.
+- **Shared decoded-image cache.** Bounded to a fraction of free RAM, so a frame is decoded
+  at most once per working scale.
+- **Safe thread lifecycle.** Background workers are never terminated mid-allocation and
+  never dropped while running — both are reliable ways to corrupt the heap and crash Qt.
+- **Non-finite values are scrubbed** at every stage, so a zero or duplicated exposure time
+  produces a clear message instead of a NaN image.
+- **A global exception hook** turns any unforeseen error into a dialog instead of the
+  silent process abort that PyQt6 performs by default.
+
+## 🧪 Tests
+
+```bash
+python tests/test_stacker.py
+```
+
+Covers the numerical core (disc detection, alignment, all three fusion engines, tonemapping,
+post-processing, every export format including Unicode paths) plus GUI stability scenarios:
+rapid ROI dragging, repeated worker cancellation, missing files, dialog cancel semantics,
+an end-to-end full-resolution export, and closing the window with work in flight.
+
+## 📋 Requirements
+
+- Python 3.10 – 3.12
+- PyQt6, OpenCV, NumPy, Pillow (see `requirements.txt`)
