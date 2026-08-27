@@ -18,7 +18,7 @@ from typing import List, Optional, Dict, Any, Tuple
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, QStandardPaths, QSettings, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QCloseEvent, QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
@@ -32,6 +32,9 @@ try:
     from core.merger import HDRMerger, HDRMergeError
     from core.postprocess import apply_postprocessing, save_image
     from core.image_cache import GLOBAL_IMAGE_CACHE, available_memory_bytes
+    from core.project import (Project, ProjectError, PROJECT_EXTENSION, PROJECT_FILTER,
+                              build_project, save_project, load_project,
+                              resolved_paths, apply_frame_records)
     from gui.exposure_list_widget import ExposureListWidget
     from gui.image_viewer import ImageViewerContainer
     from gui.controls_panel import ControlsPanel
@@ -45,6 +48,9 @@ except ImportError:  # pragma: no cover
     from ..core.merger import HDRMerger, HDRMergeError
     from ..core.postprocess import apply_postprocessing, save_image
     from ..core.image_cache import GLOBAL_IMAGE_CACHE, available_memory_bytes
+    from ..core.project import (Project, ProjectError, PROJECT_EXTENSION, PROJECT_FILTER,
+                                build_project, save_project, load_project,
+                                resolved_paths, apply_frame_records)
     from .exposure_list_widget import ExposureListWidget
     from .image_viewer import ImageViewerContainer
     from .controls_panel import ControlsPanel
@@ -74,6 +80,16 @@ def _crop_to_rect(img: np.ndarray, rect: Tuple[int, int, int, int]) -> Tuple[np.
     rw = int(np.clip(rw, 1, w - rx))
     rh = int(np.clip(rh, 1, h - ry))
     return img[ry:ry + rh, rx:rx + rw], (rx, ry, rw, rh)
+
+
+def _as_saved_rect(value) -> Optional[Tuple[int, int, int, int]]:
+    """Coerces a rectangle stored inside the settings blob back to a tuple."""
+    if not value or len(value) != 4:
+        return None
+    try:
+        return tuple(int(v) for v in value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _apply_crop(img: np.ndarray, crop_rect: Optional[Tuple[int, int, int, int]],
@@ -498,8 +514,15 @@ class SunDetectWorker(_CancellableWorker):
 class MainWindow(QMainWindow):
     """Main application window."""
 
-    def __init__(self):
+    def __init__(self, session_persistence: bool = True):
+        """
+        `session_persistence` controls the automatic last-session snapshot.
+
+        Tests construct windows freely and must not pick up — or overwrite —
+        the real user's saved session, so they turn it off.
+        """
         super().__init__()
+        self._session_persistence = bool(session_persistence)
         self.setWindowTitle("Astro HDR Stacker — Skládání expozic & Zatmění Slunce")
         # A hard minimum this large cannot be honoured on a 1280x688 desktop
         # (a 15" 1080p laptop at 150 % scaling), so keep it genuinely small and
@@ -520,6 +543,8 @@ class MainWindow(QMainWindow):
         self._retired_workers: List[QThread] = []
 
         self._stack_generation = 0
+        self._project_path: Optional[str] = None
+        self._settings_store = QSettings("AstroHDRStacker", "AstroHDRStacker")
         self._roi_active = False
         self._roi_rect: Optional[Tuple[int, int, int, int]] = None
         # User-defined output crop, in original full-resolution coordinates.
@@ -532,8 +557,11 @@ class MainWindow(QMainWindow):
         self._restack_timer.timeout.connect(self._run_stacking)
 
         self._init_ui()
+        self._init_menu()
         self._init_shortcuts()
         fit_window_to_screen(self, 1440, 900)
+        if self._session_persistence:
+            QTimer.singleShot(150, self._maybe_restore_last_session)
 
     # --------------------------------------------------------------------- UI
 
@@ -603,6 +631,64 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(bar, 0)
         self._update_memory_readout()
 
+    # ------------------------------------------------------------------ Menu
+
+    def _init_menu(self):
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("&Projekt")
+
+        def add(menu, text, slot, shortcut=None, tip=""):
+            action = QAction(text, self)
+            if shortcut:
+                action.setShortcut(QKeySequence(shortcut))
+            if tip:
+                action.setStatusTip(tip)
+            action.triggered.connect(slot)
+            menu.addAction(action)
+            return action
+
+        add(file_menu, "&Nový projekt", self.new_project, "Ctrl+N",
+            "Zavře fotky a vrátí nastavení na výchozí.")
+        add(file_menu, "&Otevřít projekt…", self.open_project, "Ctrl+Shift+O",
+            "Načte fotky, zarovnání i nastavení z dříve uloženého projektu.")
+        self.act_recent = add(file_menu, "Obnovit &poslední relaci",
+                              self.restore_last_session, None,
+                              "Načte stav, ve kterém jste program naposledy zavřeli.")
+        file_menu.addSeparator()
+        add(file_menu, "&Uložit projekt", self.save_project_action, "Ctrl+S",
+            "Uloží fotky, zarovnání, ořez i všechna nastavení.")
+        add(file_menu, "Uložit projekt &jako…", self.save_project_as, "Ctrl+Shift+S")
+        file_menu.addSeparator()
+
+        self.act_autorestore = QAction("Obnovovat poslední relaci při startu", self)
+        self.act_autorestore.setCheckable(True)
+        self.act_autorestore.setChecked(self._autorestore_enabled())
+        self.act_autorestore.toggled.connect(
+            lambda on: self._settings_store.setValue("autorestore", bool(on)))
+        file_menu.addAction(self.act_autorestore)
+        file_menu.addSeparator()
+
+        add(file_menu, "Přidat &fotky…", self.exposure_list._on_add_files, "Ctrl+O")
+        add(file_menu, "&Exportovat výsledek…", self.export_result, "Ctrl+E")
+        file_menu.addSeparator()
+        add(file_menu, "&Konec", self.close, "Ctrl+Q")
+
+        self._refresh_recent_action()
+
+    def _autorestore_enabled(self) -> bool:
+        stored = self._settings_store.value("autorestore", True)
+        return stored if isinstance(stored, bool) else str(stored).lower() != "false"
+
+    def _session_file(self) -> str:
+        """Path of the automatic 'last session' snapshot in the user's app data."""
+        base = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation)
+        if not base:
+            base = os.path.join(os.path.expanduser("~"), ".astro_hdr_stacker")
+        return os.path.join(base, "last_session" + PROJECT_EXTENSION)
+
+    def _refresh_recent_action(self):
+        self.act_recent.setEnabled(os.path.isfile(self._session_file()))
+
     def _init_shortcuts(self):
         def add(seq: str, slot):
             act = QAction(self)
@@ -610,9 +696,7 @@ class MainWindow(QMainWindow):
             act.triggered.connect(slot)
             self.addAction(act)
 
-        add("Ctrl+O", self.exposure_list._on_add_files)
         add("Ctrl+R", self.start_stacking)
-        add("Ctrl+S", self.export_result)
         add("Ctrl+M", self.open_manual_alignment)
         add("Ctrl+0", lambda: self.viewer_container.viewer.fit_to_window())
         add("Ctrl+1", lambda: self.viewer_container.viewer.actual_size_100())
@@ -683,6 +767,7 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
         self._wait_for_all_workers()
+        self._autosave_session()
         GLOBAL_IMAGE_CACHE.invalidate()
         event.accept()
 
@@ -769,6 +854,196 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_status.setText("Zobrazen celý snímek. Provádím složení plné scény...")
         self.request_restack()
+
+    # --------------------------------------------------------------- Projects
+
+    def _snapshot_project(self, project_path: Optional[str]) -> Project:
+        """Captures the whole session — frames, per-frame state and settings."""
+        return build_project(
+            self.exposure_list.items,           # every frame, not just the active ones
+            self.controls.get_settings(),
+            project_path=project_path,
+            crop_rect=self._crop_rect,
+            roi_active=self._roi_active,
+            roi_rect=self._roi_rect,
+            roi_size=self.viewer_container.combo_roi_size.currentData() or 300,
+            ev_step=self.exposure_list.spin_ev_step.value(),
+            preset_name=self.controls.combo_preset.currentText(),
+            compare_mode=self.viewer_container.btn_split.isChecked(),
+            histogram_visible=self.viewer_container.btn_hist.isChecked(),
+        )
+
+    def new_project(self):
+        self._restack_timer.stop()
+        self._retire_worker(self._worker)
+        self._worker = None
+        self._stack_generation += 1
+
+        self.exposure_list.clear_all()
+        self.controls.chk_crop.setChecked(False)
+        self.viewer_container.btn_roi_toggle.setChecked(False)
+        self.controls.reset_adjustments()
+        self._crop_rect = None
+        self._base_merged_bgr = None
+        self._preview_base_bgr = None
+        self._hdr_radiance_map = None
+        self._project_path = None
+        self.viewer_container.viewer.set_crop_rect(None)
+        self.controls.btn_export.setEnabled(False)
+        self._update_title()
+        self.lbl_status.setText("Nový projekt. Přetáhněte sem fotky nebo je přidejte tlačítkem.")
+
+    def save_project_action(self):
+        if self._project_path:
+            self._write_project(self._project_path)
+        else:
+            self.save_project_as()
+
+    def save_project_as(self):
+        if not self.exposure_list.items:
+            QMessageBox.information(self, "Prázdný projekt",
+                                    "Nejdřív načtěte fotky, které chcete uložit.")
+            return
+        suggested = self._project_path or os.path.join(
+            os.path.dirname(self.exposure_list.items[0].filepath),
+            "zatmeni_projekt" + PROJECT_EXTENSION)
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Uložit projekt", suggested, PROJECT_FILTER)
+        if filepath:
+            self._write_project(filepath)
+
+    def _write_project(self, filepath: str) -> bool:
+        try:
+            save_project(self._snapshot_project(filepath), filepath)
+        except ProjectError as e:
+            QMessageBox.critical(self, "Chyba uložení projektu", str(e))
+            return False
+        self._project_path = filepath
+        self._update_title()
+        self.lbl_status.setText(
+            f"💾 Projekt uložen: {os.path.basename(filepath)} "
+            f"({len(self.exposure_list.items)} snímků včetně zarovnání a nastavení)")
+        return True
+
+    def open_project(self):
+        start_dir = os.path.dirname(self._project_path) if self._project_path else ""
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "Otevřít projekt", start_dir, PROJECT_FILTER)
+        if filepath:
+            self._load_project_file(filepath, remember_path=True)
+
+    def restore_last_session(self):
+        session = self._session_file()
+        if not os.path.isfile(session):
+            self.lbl_status.setText("Žádná uložená relace nebyla nalezena.")
+            return
+        # The auto-snapshot is not a project the user named, so it does not
+        # become the current project path — Ctrl+S must not overwrite it.
+        self._load_project_file(session, remember_path=False)
+
+    def _maybe_restore_last_session(self):
+        if not self._autorestore_enabled():
+            return
+        session = self._session_file()
+        if os.path.isfile(session) and not self.exposure_list.items:
+            self._load_project_file(session, remember_path=False, quiet=True)
+
+    def _load_project_file(self, filepath: str, remember_path: bool,
+                           quiet: bool = False) -> bool:
+        """Loads a project and applies it to every part of the UI."""
+        try:
+            project, missing = load_project(filepath)
+        except ProjectError as e:
+            if not quiet:
+                QMessageBox.critical(self, "Chyba otevření projektu", str(e))
+            return False
+
+        found = resolved_paths(project, filepath)
+        if not found:
+            message = ("Žádnou z fotek uložených v projektu se nepodařilo najít.\n\n"
+                       "Fotky byly zřejmě přesunuty nebo smazány. Projekt ukládá jen "
+                       "cesty k souborům, ne samotné fotografie.")
+            if quiet:
+                self.lbl_status.setText("Poslední relaci nelze obnovit — fotky nebyly nalezeny.")
+            else:
+                QMessageBox.warning(self, "Fotky nenalezeny", message)
+            return False
+
+        self._restack_timer.stop()
+        self._retire_worker(self._worker)
+        self._worker = None
+        self._stack_generation += 1
+
+        # Order matters: load the frames, restore their per-frame state, then the
+        # settings, and only then trigger a single stack.
+        self.exposure_list.clear_all()
+        self.exposure_list.spin_ev_step.setValue(project.ev_step)
+        self.exposure_list.load_files(found)
+        matched = apply_frame_records(project, self.exposure_list.items, filepath)
+        self.exposure_list.refresh_table()
+
+        self.controls.apply_settings(project.settings)
+        self.controls.set_preset_name(project.preset_name)
+        self._crop_rect = project.crop_rect or _as_saved_rect(project.settings.get('crop_rect'))
+        self.viewer_container.viewer.set_crop_rect(None)
+
+        self.viewer_container.btn_hist.setChecked(project.histogram_visible)
+        self.viewer_container.btn_split.setChecked(project.compare_mode)
+
+        roi_index = self.viewer_container.combo_roi_size.findData(project.roi_size)
+        if roi_index >= 0:
+            self.viewer_container.combo_roi_size.setCurrentIndex(roi_index)
+
+        self._setup_initial_preview()
+
+        self._roi_rect = project.roi_rect
+        self.viewer_container.btn_roi_toggle.setChecked(bool(project.roi_active))
+        if project.roi_active and project.roi_rect:
+            self.viewer_container.viewer.set_roi_center(
+                project.roi_rect[0] + project.roi_rect[2] // 2,
+                project.roi_rect[1] + project.roi_rect[3] // 2,
+                emit_signal=False)
+            self._roi_active = True
+            self._roi_rect = project.roi_rect
+
+        self._project_path = filepath if remember_path else None
+        self._update_title()
+
+        shifted = sum(1 for it in self.exposure_list.items
+                      if abs(it.shift_x) > 0.01 or abs(it.shift_y) > 0.01)
+        summary = (f"📂 Načteno {len(found)} snímků, obnoveno zarovnání u {matched} z nich "
+                   f"({shifted} s posunem) a všechna nastavení.")
+        if missing:
+            summary += f"  ⚠ Chybí {len(missing)} souborů."
+            if not quiet:
+                QMessageBox.warning(
+                    self, "Některé fotky chybí",
+                    f"{len(missing)} fotek z projektu se nepodařilo najít a byly vynechány:\n\n"
+                    + "\n".join(os.path.basename(m) for m in missing[:12])
+                    + ("\n…" if len(missing) > 12 else ""))
+        self.lbl_status.setText(summary)
+
+        self.request_restack()
+        return True
+
+    def _update_title(self):
+        base = "Astro HDR Stacker — Skládání expozic & Zatmění Slunce"
+        if self._project_path:
+            self.setWindowTitle(f"{os.path.basename(self._project_path)} — {base}")
+        else:
+            self.setWindowTitle(base)
+
+    def _autosave_session(self):
+        """Snapshots the session on exit so it can be picked up next time."""
+        if not self._session_persistence or not self.exposure_list.items:
+            return
+        session = self._session_file()
+        try:
+            os.makedirs(os.path.dirname(session), exist_ok=True)
+            save_project(self._snapshot_project(session), session)
+        except (ProjectError, OSError) as e:
+            # Never let a failed convenience snapshot block closing the app.
+            print(f"Could not autosave session: {e}")
 
     # ------------------------------------------------------------------ Crop
 

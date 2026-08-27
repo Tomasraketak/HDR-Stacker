@@ -99,8 +99,26 @@ jakmile výběr dokončíte, uvidíte rovnou oříznutý výsledek.
 Ořez se použije **stejně na všechny expozice** — v náhledu i při exportu. Zarovnání
 proběhne ještě před ořezem, takže se u okrajů neztrácí obrazová data.
 
-### 6. Exportujte
-**`💾 Exportovat`** (`Ctrl+S`) spočítá výsledek znovu z originálů v plném rozlišení
+### 6. Uložte si projekt
+Přes menu **`Projekt → Uložit projekt`** (`Ctrl+S`) si uložte celé rozpracování do
+souboru `.ahdrproj`. Uloží se **všechno**: které fotky jsou načtené, ruční i automatické
+zarovnání každého snímku, které snímky jsou vyřazené, ořez, metoda HDR, zarovnání
+a všechny posuvníky.
+
+Příště stačí **`Projekt → Otevřít projekt`** (`Ctrl+Shift+O`) a jste přesně tam,
+kde jste skončili — žádné znovunastavování.
+
+Program navíc při zavření **automaticky ukládá poslední relaci** a při dalším spuštění
+ji sám obnoví. Vypnout to jde v menu **`Projekt → Obnovovat poslední relaci při startu`**,
+ručně vyvolat přes **`Obnovit poslední relaci`**.
+
+> **Co projekt obsahuje:** jen cesty k fotkám a vaše nastavení, ne samotné fotografie —
+> soubor má pár kilobajtů. Když fotky přesunete, projekt je nenajde; když ale přesunete
+> **celou složku i s projektem**, funguje dál, protože se ukládají i relativní cesty.
+> Chybějící fotky se jen nahlásí a zbytek projektu se načte.
+
+### 7. Exportujte
+**`💾 Exportovat`** (`Ctrl+E`) spočítá výsledek znovu z originálů v plném rozlišení
 a uloží ho jako **16bitový TIFF**, **JPEG**, **16bitový PNG** nebo **32bitový Radiance HDR**.
 Náhled je záměrně zmenšený kvůli rychlosti — na kvalitu exportu to nemá vliv.
 
@@ -108,11 +126,15 @@ Náhled je záměrně zmenšený kvůli rychlosti — na kvalitu exportu to nem�
 
 | Zkratka | Akce |
 |---|---|
+| `Ctrl+N` | Nový projekt |
+| `Ctrl+S` / `Ctrl+Shift+S` | Uložit projekt / uložit jako |
+| `Ctrl+Shift+O` | Otevřít projekt |
 | `Ctrl+O` | Přidat fotky |
 | `Ctrl+R` | Složit snímky |
-| `Ctrl+S` | Exportovat v plné kvalitě |
+| `Ctrl+E` | Exportovat v plné kvalitě |
 | `Ctrl+M` | Ruční dozarovnání |
 | `Ctrl+0` / `Ctrl+1` | Přizpůsobit oknu / zobrazit 1:1 |
+| `Ctrl+Q` | Konec |
 | Kolečko myši | Zoom · dvojklik = přizpůsobit |
 
 ---
@@ -125,6 +147,7 @@ Náhled je záměrně zmenšený kvůli rychlosti — na kvalitu exportu to nem�
 | Hlásí nedostatek paměti při exportu | Program sám nabídne export ve zmenšeném rozlišení — potvrďte **Ano**. Pomůže i zavření prohlížeče. |
 | „Všechny snímky mají prakticky stejný expoziční čas“ | Snímky nemají použitelné EXIF časy. Přepněte **Metodu HDR** na **Mertens**, která časy nepotřebuje. |
 | Disk Měsíce se nenajde | Použijte **🛠️ Ruční dozarovnání** a posuňte snímky ručně podle rozdílového náhledu. |
+| Projekt nenajde fotky | Fotky byly přesunuty. Přesouvejte vždy celou složku i s projektem — pak fungují relativní cesty. |
 | Export se nepodaří zapsat | Zkontrolujte, že soubor není otevřený v jiném programu a že do složky lze zapisovat. |
 | Chyba při instalaci PyQt6 | Použijte Python 3.12 místo 3.13+. |
 | Okno se nevejde na obrazovku | Okna se sama zmenší podle plochy monitoru. Ovládací panely lze rolovat, takže tlačítka dole zůstanou vždy dosažitelná. |
@@ -153,6 +176,11 @@ výpisu pod tlačítkem *Show Details*) a **běží dál** — rozpracovaná pr�
   multi-scale coronal enhancement that is gated off in the dark sky, so grain is never sharpened.
 - **Export** — 16-bit TIFF, 16-bit PNG, quality JPEG and 32-bit Radiance HDR, with
   Unicode-safe file writing.
+- **Project files** — save the whole session (frames, per-frame alignment, exclusions,
+  crop, every setting) to a small JSON `.ahdrproj` and reopen it exactly as it was.
+  Paths are stored both absolutely and relative to the project, so moving a folder with
+  its project intact keeps working; missing photos are reported and skipped rather than
+  aborting the load. The session is also snapshotted automatically on exit.
 
 ## 🧠 Stability and performance notes
 

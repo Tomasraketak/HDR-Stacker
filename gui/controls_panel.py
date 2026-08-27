@@ -480,6 +480,103 @@ class ControlsPanel(QWidget):
             self._loading_preset = False
         self.live_adjust_requested.emit()
 
+    def apply_settings(self, settings: Dict[str, Any]):
+        """
+        Restores every control from a saved project.
+
+        Signals are suppressed for the whole restore so the half-applied
+        intermediate states never trigger a stack; the caller re-stacks once at
+        the end. Unknown or missing keys keep the current value, which is what
+        makes a project written by an older build still load cleanly.
+        """
+        if not settings:
+            return
+
+        self._loading_preset = True
+        widgets = [self.combo_proxy, self.combo_algo, self.combo_align,
+                   self.combo_tonemap, self.combo_preset, self.chk_crop,
+                   self.btn_crop_select]
+        widgets += list(self.spin_crop.values())
+        sliders = [self.slider_m_contrast, self.slider_m_sat, self.slider_m_exp,
+                   self.slider_brightness, self.slider_contrast, self.slider_gamma,
+                   self.slider_saturation, self.slider_shadows, self.slider_highlights,
+                   self.slider_denoise, self.slider_coronal_boost, self.slider_coronal_radius]
+
+        for widget in widgets:
+            widget.blockSignals(True)
+        for slider in sliders:
+            slider.slider.blockSignals(True)
+
+        try:
+            self._select_by_data(self.combo_proxy, settings.get('proxy_scale'))
+            self._select_by_data(self.combo_algo, settings.get('algo'))
+            self._select_by_data(self.combo_align, settings.get('align_method'))
+            self._select_by_data(self.combo_tonemap, settings.get('tonemap_method'))
+
+            for key, slider in (
+                ('mertens_contrast', self.slider_m_contrast),
+                ('mertens_saturation', self.slider_m_sat),
+                ('mertens_exposure', self.slider_m_exp),
+                ('brightness', self.slider_brightness),
+                ('contrast', self.slider_contrast),
+                ('gamma', self.slider_gamma),
+                ('saturation', self.slider_saturation),
+                ('shadows', self.slider_shadows),
+                ('highlights', self.slider_highlights),
+                ('denoise', self.slider_denoise),
+                ('coronal_boost', self.slider_coronal_boost),
+                ('coronal_radius', self.slider_coronal_radius),
+            ):
+                value = settings.get(key)
+                if isinstance(value, (int, float)):
+                    slider.setValue(float(value))
+
+            crop = settings.get('crop_rect')
+            self.chk_crop.setChecked(bool(crop))
+            self._set_crop_controls_enabled(bool(crop))
+            if crop and len(crop) == 4:
+                for key, value in zip(("x", "y", "w", "h"), crop):
+                    self.spin_crop[key].setValue(int(value))
+                self.lbl_crop_info.setText(
+                    f"Ořez {int(crop[2])} × {int(crop[3])} px  ·  "
+                    f"{int(crop[2]) * int(crop[3]) / 1e6:.1f} Mpx")
+            else:
+                self.lbl_crop_info.setText("Ořez vypnut — pracuje se s celým snímkem.")
+            self.btn_crop_select.setChecked(False)
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+            for slider in sliders:
+                slider.slider.blockSignals(False)
+            self._loading_preset = False
+
+        # Keep the dependent sections consistent with the restored algorithm.
+        is_mertens = (self.combo_algo.currentData() == "mertens")
+        self.mertens_box.setVisible(is_mertens)
+        self.tonemap_box.setVisible(not is_mertens)
+        # Slider labels are updated by the valueChanged signal we just blocked.
+        for slider in sliders:
+            slider.lbl_val.setText(slider._format(slider.value()))
+
+    def set_preset_name(self, name: str):
+        """Restores the preset selection without re-applying its values."""
+        if not name:
+            return
+        index = self.combo_preset.findText(name)
+        if index >= 0:
+            self.combo_preset.blockSignals(True)
+            self.combo_preset.setCurrentIndex(index)
+            self.combo_preset.blockSignals(False)
+
+    @staticmethod
+    def _select_by_data(combo: QComboBox, data: Any):
+        """Selects the entry carrying `data`; leaves the combo alone if absent."""
+        if data is None:
+            return
+        index = combo.findData(data)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
     def get_settings(self) -> Dict[str, Any]:
         return {
             'proxy_scale': self.combo_proxy.currentData(),

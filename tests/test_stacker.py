@@ -10,6 +10,8 @@ Run with:  python tests/test_stacker.py
 
 import os
 import sys
+import json
+import shutil
 import tempfile
 import time
 import traceback
@@ -36,6 +38,8 @@ from core.postprocess import (
     apply_denoise, imread_unicode,
 )
 from core.image_cache import ImageCache, available_memory_bytes
+from core.project import (build_project, save_project, load_project, resolved_paths,
+                          apply_frame_records, ProjectError, PROJECT_FORMAT_VERSION)
 
 _FAILURES = []
 _PASSES = 0
@@ -475,6 +479,128 @@ def test_image_cache(paths):
     check(mem is None or mem > 0, "memory probe must return None or a positive value")
 
 
+def test_projects(tmpdir, paths):
+    section("6b. Project files — saving and reopening a session")
+
+    items = inspect_exposure_files(paths, user_ev_step=1.0)
+    items[0].shift_x, items[0].shift_y = 7.5, -3.5
+    items[2].is_valid = False
+    settings = {"gamma": 1.75, "algo": "debevec", "crop_rect": (40, 30, 280, 220)}
+
+    # A Unicode project name in a Unicode folder — the normal Czech case.
+    project_dir = os.path.join(tmpdir, "můj projekt")
+    os.makedirs(project_dir, exist_ok=True)
+    project_path = os.path.join(project_dir, "zatmění 2026.ahdrproj")
+
+    save_project(build_project(items, settings, project_path=project_path,
+                               crop_rect=(40, 30, 280, 220), ev_step=1.5,
+                               roi_active=True, roi_rect=(10, 20, 300, 300)),
+                 project_path)
+    check(os.path.isfile(project_path), "project must be written to a Unicode path")
+
+    loaded, missing = load_project(project_path)
+    check(not missing, f"no frames should be missing right after saving: {missing}")
+    check(len(loaded.frames) == len(items), "every frame must be stored")
+    check(loaded.settings == settings, "settings must round-trip exactly")
+    check(loaded.crop_rect == (40, 30, 280, 220), "the crop must round-trip")
+    check(loaded.roi_active is True and loaded.roi_rect == (10, 20, 300, 300),
+          "ROI state must round-trip")
+    check(abs(loaded.ev_step - 1.5) < 1e-6, "the EV step must round-trip")
+    check(loaded.format_version == PROJECT_FORMAT_VERSION, "format version is recorded")
+
+    # Per-frame state must land on the right frames even though re-inspection
+    # re-sorts the list by exposure.
+    fresh = inspect_exposure_files(resolved_paths(loaded, project_path), user_ev_step=1.0)
+    matched = apply_frame_records(loaded, fresh, project_path)
+    check(matched == len(items), f"every frame must be matched by path ({matched})")
+    restored = {os.path.basename(it.filepath): (round(it.shift_x, 1), round(it.shift_y, 1),
+                                                it.is_valid) for it in fresh}
+    original = {os.path.basename(it.filepath): (round(it.shift_x, 1), round(it.shift_y, 1),
+                                                it.is_valid) for it in items}
+    check(restored == original, "shifts and exclusions must be restored per frame")
+
+    # Moving the whole folder must keep the project working, via relative paths.
+    # The project and its photos have to live in one self-contained folder for
+    # that to be a meaningful test — that is how a card gets copied to a laptop.
+    bundle = os.path.join(tmpdir, "výprava")
+    os.makedirs(bundle, exist_ok=True)
+    bundle_photos = []
+    for src in paths:
+        dst = os.path.join(bundle, os.path.basename(src))
+        shutil.copy2(src, dst)
+        bundle_photos.append(dst)
+    bundle_items = inspect_exposure_files(bundle_photos, user_ev_step=1.0)
+    bundle_items[0].shift_x = 4.5
+    bundle_project = os.path.join(bundle, "výprava.ahdrproj")
+    save_project(build_project(bundle_items, settings, project_path=bundle_project),
+                 bundle_project)
+
+    moved_root = os.path.join(tmpdir, "přesunuto")
+    shutil.copytree(bundle, moved_root)
+    moved_project = os.path.join(moved_root, "výprava.ahdrproj")
+    moved, moved_missing = load_project(moved_project)
+    moved_found = resolved_paths(moved, moved_project)
+    check(not moved_missing and len(moved_found) == len(bundle_photos),
+          f"a moved project must still find its photos ({len(moved_found)})")
+    check(all(moved_root in f for f in moved_found),
+          "a moved project must use the photos next to it, not the originals")
+
+    # A deleted photo is reported but must not abort the load.
+    # Delete from the copy AND make the original unreachable for that frame,
+    # otherwise the absolute-path fallback legitimately finds the original.
+    os.remove(os.path.join(moved_root, os.path.basename(bundle_photos[1])))
+    os.remove(bundle_photos[1])
+    partial, partial_missing = load_project(moved_project)
+    partial_found = resolved_paths(partial, moved_project)
+    check(len(partial_missing) == 1, f"the missing photo must be reported ({partial_missing})")
+    check(len(partial_found) == len(bundle_photos) - 1,
+          "the remaining photos must still load")
+
+    # Malformed input must raise a clear error, never a traceback.
+    for name, content in (("broken.ahdrproj", "{not json at all"),
+                          ("alien.ahdrproj", '{"something": 1}')):
+        bad = os.path.join(tmpdir, name)
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write(content)
+        try:
+            load_project(bad)
+            check(False, f"{name} must be rejected")
+        except ProjectError:
+            check(True, "")
+
+    try:
+        load_project(os.path.join(tmpdir, "does-not-exist.ahdrproj"))
+        check(False, "a missing project file must be rejected")
+    except ProjectError:
+        check(True, "")
+
+    # A project from a newer build must be refused rather than half-read.
+    future = os.path.join(tmpdir, "future.ahdrproj")
+    with open(project_path, encoding="utf-8") as f:
+        payload = json.load(f)
+    payload["format_version"] = PROJECT_FORMAT_VERSION + 5
+    with open(future, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    try:
+        load_project(future)
+        check(False, "a newer format version must be refused")
+    except ProjectError as e:
+        check("novější verzí" in str(e), "the version error must explain itself")
+
+    # Unknown keys from a future build must be ignored, not fatal.
+    forward = os.path.join(tmpdir, "forward.ahdrproj")
+    with open(project_path, encoding="utf-8") as f:
+        payload = json.load(f)
+    payload["future_top_level"] = {"x": 1}
+    payload["frames"][0]["future_frame_field"] = 42
+    with open(forward, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    forward_project, _ = load_project(forward)
+    check(len(forward_project.frames) == len(items),
+          "unknown keys from a newer build must be ignored, not fatal")
+    print(f"   project round-trip verified, {os.path.getsize(project_path)} B on disk")
+
+
 # ----------------------------------------------------------------- GUI tests
 
 def test_gui(paths):
@@ -499,7 +625,9 @@ def test_gui(paths):
           "every GUI module must import")
     print("   all GUI modules import cleanly")
 
-    window = MainWindow()
+    # session_persistence off: a test must not read or overwrite the real
+    # user's auto-saved session.
+    window = MainWindow(session_persistence=False)
     window.show()
     window.exposure_list.load_files(paths)
     check(len(window.exposure_list.items) == 9, "GUI must load all 9 frames")
@@ -736,6 +864,87 @@ def test_gui(paths):
     pump(300)
     check(window._crop_rect is None, "disabling the crop must clear it everywhere")
 
+    # (f4) A whole session must survive save -> quit -> reopen.
+    session_dir = os.path.join(os.path.dirname(paths[0]), "relace")
+    os.makedirs(session_dir, exist_ok=True)
+    session_project = os.path.join(session_dir, "relace.ahdrproj")
+
+    window.exposure_list.items[0].shift_x = 6.5
+    window.exposure_list.items[0].shift_y = -2.5
+    window.exposure_list.items[1].is_valid = False
+    window.controls.combo_align.setCurrentIndex(1)
+    window.controls.slider_gamma.setValue(1.65)
+    window.controls.slider_coronal_boost.setValue(0.85)
+    window.controls.chk_crop.setChecked(True)
+    pump(400)
+    for key, value in (("x", 30), ("y", 25), ("w", 260), ("h", 210)):
+        window.controls.spin_crop[key].setValue(value)
+    pump(300)
+
+    saved_settings = dict(window.controls.get_settings())
+    saved_frames = {os.path.basename(it.filepath):
+                    (round(it.shift_x, 1), round(it.shift_y, 1), it.is_valid)
+                    for it in window.exposure_list.items}
+
+    check(window._write_project(session_project), "the session must save")
+    check(os.path.isfile(session_project), "the project file must exist")
+    check(window._project_path == session_project, "the project path must be remembered")
+    check(os.path.basename(session_project) in window.windowTitle(),
+          "the title bar must name the open project")
+
+    # A genuinely fresh window, as if the app had been restarted.
+    reopened = MainWindow(session_persistence=False)
+    reopened.show()
+    check(reopened._load_project_file(session_project, remember_path=True),
+          "the project must reopen")
+    pump(1500)
+
+    restored_settings = dict(reopened.controls.get_settings())
+    drifted = [k for k, v in saved_settings.items() if restored_settings.get(k) != v]
+    check(not drifted, f"every setting must survive the round trip (drifted: {drifted})")
+
+    restored_frames = {os.path.basename(it.filepath):
+                       (round(it.shift_x, 1), round(it.shift_y, 1), it.is_valid)
+                       for it in reopened.exposure_list.items}
+    check(restored_frames == saved_frames,
+          "alignment shifts and exclusions must be restored onto the right frames")
+    check(reopened._crop_rect == (30, 25, 260, 210),
+          f"the crop must be restored (got {reopened._crop_rect})")
+    print(f"   session round-trip: {len(restored_frames)} frames, "
+          f"{len(saved_settings)} settings, crop and alignment all restored")
+
+    # The automatic end-of-session snapshot must be reloadable too. It is
+    # redirected into the temp folder so the real user's file is untouched.
+    snapshot = os.path.join(session_dir, "auto_session.ahdrproj")
+    reopened._session_file = lambda: snapshot
+    reopened._session_persistence = True
+    reopened._autosave_session()
+    check(os.path.isfile(reopened._session_file()),
+          "closing must leave an auto-restorable session snapshot")
+    reopened.exposure_list.clear_all()
+    reopened.restore_last_session()
+    pump(1200)
+    check(len(reopened.exposure_list.items) == len(saved_frames),
+          "the auto-saved session must restore every frame")
+    check(reopened._project_path is None,
+          "restoring the auto-snapshot must not make it the current project, "
+          "so Ctrl+S cannot overwrite it")
+
+    # Opening a corrupt project must report, not crash, and leave state intact.
+    broken_project = os.path.join(session_dir, "rozbity.ahdrproj")
+    with open(broken_project, "w", encoding="utf-8") as f:
+        f.write("{ tohle rozhodne neni projekt")
+    before_count = len(reopened.exposure_list.items)
+    check(reopened._load_project_file(broken_project, remember_path=True, quiet=True) is False,
+          "a corrupt project must fail cleanly")
+    check(len(reopened.exposure_list.items) == before_count,
+          "a failed load must not destroy the open session")
+
+    reopened.controls.chk_crop.setChecked(False)
+    reopened.close()
+    window.controls.chk_crop.setChecked(False)
+    pump(300)
+
     # (g) End-to-end export through the real worker, including alignment,
     #     fusion, post-processing and the 16-bit write.
     from gui.main_window import FullResExportWorker
@@ -791,6 +1000,7 @@ def run_all_tests() -> int:
         enhanced = test_postprocessing(fusion)
         test_export(tmpdir, enhanced, hdr)
         test_image_cache(paths)
+        test_projects(tmpdir, paths)
 
         try:
             test_gui(paths)
