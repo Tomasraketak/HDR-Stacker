@@ -53,9 +53,20 @@ a EV odhadne z kroku, který nastavíte v poli **Krok expozice**.
 Snímek můžete kdykoliv vyřadit odškrtnutím políčka v prvním sloupci seznamu.
 
 ### 2. Zarovnejte snímky
-- **`🌑 Detekce černého disku Měsíce`** (výchozí) najde kruhový černý disk Měsíce v záři
-  korony a zarovná snímky subpixelově. Krajina a stromy jsou odfiltrovány testem kruhovosti.
+- **`💡 Podle statických světel`** (výchozí) je nejpřesnější volba, když máte v záběru
+  krajinu. Najde vzor pouličních lamp a vzdálených světel v dolní části snímku. Ta se
+  nehýbou, takže měří **přímo otřesy fotoaparátu**. Na testovacích datech dosahuje
+  přesnosti kolem **0,08 px** proti 1,5 px u zarovnání podle disku.
+  Lampy se párují jako souhvězdí, ne podle jasu pixelů, takže to funguje napříč celou
+  expoziční řadou. Snímky, které se nepodaří spolehlivě zarovnat, program **nechá být
+  a nahlásí je** ve stavovém řádku — ty pak doladíte ručně.
+- **`🌑 Detekce černého disku Měsíce`** najde kruhový disk Měsíce v záři korony.
+  Použijte, když je v záběru jen obloha, nebo když se Slunce mezi snímky posunulo.
 - **`🚫 Bez zarovnání`** použijte, pokud jste fotili z pevného stativu.
+
+> **Pozor na rozdíl:** zarovnání podle lamp srovná **krajinu**, zarovnání podle disku
+> srovná **korónu**. Během delší série se Slunce po obloze posune, takže obojí naráz
+> nejde — vyberte si, co má ve výsledku sedět.
 - **`🛠️ Ruční dozarovnání`** (`Ctrl+M`) otevře okno pro doladění snímek po snímku:
   - Režim **Rozdíl hran** — nesedící hrany svítí barevně, sedící zmizí. Nejpřesnější.
   - Režim **Blend** a **Blikání** pro rychlou kontrolu.
@@ -79,7 +90,16 @@ V panelu vpravo:
   chráněná, takže se nezvýrazňuje šum.
 - Dvojklikem na jakýkoliv posuvník ho vrátíte na výchozí hodnotu.
 
-### 5. Exportujte
+### 5. Ořízněte (volitelné)
+V panelu vpravo zaškrtněte **`Oříznout výsledek`**. Pak buď klikněte na
+**`🖱️ Vybrat oblast myší`** a táhněte přes snímek, nebo zadejte X, Y, šířku a výšku
+číselně. Během výběru se zobrazí celý snímek s oranžovým rámečkem a vodítky třetin;
+jakmile výběr dokončíte, uvidíte rovnou oříznutý výsledek.
+
+Ořez se použije **stejně na všechny expozice** — v náhledu i při exportu. Zarovnání
+proběhne ještě před ořezem, takže se u okrajů neztrácí obrazová data.
+
+### 6. Exportujte
 **`💾 Exportovat`** (`Ctrl+S`) spočítá výsledek znovu z originálů v plném rozlišení
 a uloží ho jako **16bitový TIFF**, **JPEG**, **16bitový PNG** nebo **32bitový Radiance HDR**.
 Náhled je záměrně zmenšený kvůli rychlosti — na kvalitu exportu to nemá vliv.

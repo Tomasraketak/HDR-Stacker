@@ -14,8 +14,10 @@ from typing import Dict, Any
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel,
-    QSlider, QComboBox, QPushButton, QScrollArea, QFrame, QSizePolicy
+    QSlider, QComboBox, QPushButton, QScrollArea, QFrame, QSizePolicy,
+    QSpinBox, QCheckBox, QGridLayout
 )
+from typing import Optional, Tuple
 
 
 class SliderRow(QWidget):
@@ -85,6 +87,9 @@ class ControlsPanel(QWidget):
     stack_requested = pyqtSignal()
     live_adjust_requested = pyqtSignal()
     merge_param_changed = pyqtSignal()
+    crop_changed = pyqtSignal(object)          # (x, y, w, h) or None
+    crop_select_requested = pyqtSignal(bool)
+    crop_defaults_requested = pyqtSignal()     # enabled with no usable rectangle yet
     manual_align_requested = pyqtSignal()
     export_requested = pyqtSignal()
 
@@ -122,6 +127,7 @@ class ControlsPanel(QWidget):
         layout.setSpacing(14)
 
         layout.addWidget(self._build_engine_group())
+        layout.addWidget(self._build_crop_group())
         layout.addWidget(self._build_corona_group())
         layout.addWidget(self._build_adjust_group())
         layout.addStretch()
@@ -167,9 +173,14 @@ class ControlsPanel(QWidget):
         self.combo_algo.currentIndexChanged.connect(self._on_algo_changed)
 
         self.combo_align = self._labelled_combo(vbox, "Zarovnání:", [
+            ("💡  Podle statických světel (lampy)", "static_lights"),
             ("🌑  Detekce černého disku Měsíce", "eclipse_disc"),
             ("🚫  Bez zarovnání (stativ)", "none"),
-        ], tip="Najde kruhový disk Měsíce v záři korony a zarovná snímky subpixelově.")
+        ], tip="💡 Podle světel: najde vzor pouličních lamp a vzdálených světel\n"
+               "v dolní části snímku. Ta se nehýbou, takže měří přímo otřesy\n"
+               "fotoaparátu — nejpřesnější volba, když je v záběru krajina.\n\n"
+               "🌑 Podle disku Měsíce: zarovná na korónu. Použijte, když je\n"
+               "v záběru jen obloha, nebo když se Slunce mezi snímky posunulo.")
         self.combo_align.currentIndexChanged.connect(self.merge_param_changed.emit)
 
         self.btn_manual_align = QPushButton("🛠️  Ruční dozarovnání snímek po snímku…")
@@ -213,6 +224,140 @@ class ControlsPanel(QWidget):
         vbox.addWidget(self.tonemap_box)
 
         return group
+
+    def _build_crop_group(self) -> QGroupBox:
+        """Output crop, applied identically to every exposure and to the export."""
+        group = QGroupBox("Ořez snímku")
+        vbox = QVBoxLayout(group)
+        vbox.setSpacing(7)
+
+        self.chk_crop = QCheckBox("Oříznout výsledek")
+        self.chk_crop.setToolTip(
+            "Ořez se použije na všechny expozice stejně — v náhledu i při exportu.\n"
+            "Zarovnání proběhne ještě před ořezem, takže se u okrajů neztrácí data.")
+        self.chk_crop.toggled.connect(self._on_crop_toggled)
+        vbox.addWidget(self.chk_crop)
+
+        self.btn_crop_select = QPushButton("🖱️  Vybrat oblast myší")
+        self.btn_crop_select.setCheckable(True)
+        self.btn_crop_select.setToolTip("Táhněte myší přes snímek a vyberte oblast ořezu.")
+        self.btn_crop_select.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_crop_select.toggled.connect(self._on_crop_select_toggled)
+        vbox.addWidget(self.btn_crop_select)
+
+        grid = QGridLayout()
+        grid.setSpacing(5)
+        self.spin_crop = {}
+        for col, (key, label) in enumerate((("x", "X:"), ("y", "Y:"))):
+            lbl = QLabel(label)
+            lbl.setObjectName("SliderLabel")
+            grid.addWidget(lbl, 0, col * 2)
+            grid.addWidget(self._make_crop_spin(key), 0, col * 2 + 1)
+        for col, (key, label) in enumerate((("w", "Šířka:"), ("h", "Výška:"))):
+            lbl = QLabel(label)
+            lbl.setObjectName("SliderLabel")
+            grid.addWidget(lbl, 1, col * 2)
+            grid.addWidget(self._make_crop_spin(key), 1, col * 2 + 1)
+        vbox.addLayout(grid)
+
+        self.btn_crop_reset = QPushButton("Celý snímek (zrušit ořez)")
+        self.btn_crop_reset.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_crop_reset.clicked.connect(lambda: self.chk_crop.setChecked(False))
+        vbox.addWidget(self.btn_crop_reset)
+
+        self.lbl_crop_info = QLabel("Ořez vypnut — pracuje se s celým snímkem.")
+        self.lbl_crop_info.setObjectName("StatusHint")
+        self.lbl_crop_info.setWordWrap(True)
+        vbox.addWidget(self.lbl_crop_info)
+
+        self._set_crop_controls_enabled(False)
+        return group
+
+    def _make_crop_spin(self, key: str) -> QSpinBox:
+        spin = QSpinBox()
+        spin.setRange(0, 100000)
+        spin.setSingleStep(10)
+        spin.setSuffix(" px")
+        spin.setMinimumWidth(78)
+        spin.valueChanged.connect(self._on_crop_spin_changed)
+        self.spin_crop[key] = spin
+        return spin
+
+    def _set_crop_controls_enabled(self, enabled: bool):
+        for spin in self.spin_crop.values():
+            spin.setEnabled(enabled)
+        self.btn_crop_select.setEnabled(enabled)
+        self.btn_crop_reset.setEnabled(enabled)
+
+    def _on_crop_toggled(self, checked: bool):
+        self._set_crop_controls_enabled(checked)
+        if not checked:
+            self.btn_crop_select.setChecked(False)
+            self.lbl_crop_info.setText("Ořez vypnut — pracuje se s celým snímkem.")
+            self.crop_changed.emit(None)
+        else:
+            self._emit_crop()
+
+    def _on_crop_select_toggled(self, checked: bool):
+        if checked and not self.chk_crop.isChecked():
+            self.chk_crop.setChecked(True)
+        self.crop_select_requested.emit(checked)
+
+    def _on_crop_spin_changed(self, _value: int = 0):
+        if self._loading_preset or not self.chk_crop.isChecked():
+            return
+        self._emit_crop()
+
+    def _emit_crop(self):
+        rect = self.get_crop_rect()
+        if rect is None:
+            # Enabled but empty: ask the window to seed it from the real frame
+            # size, so the user starts from the whole image rather than 0x0.
+            self.lbl_crop_info.setText("Nastavuji výchozí ořez…")
+            self.crop_defaults_requested.emit()
+            return
+        self.lbl_crop_info.setText(
+            f"Ořez {rect[2]} × {rect[3]} px  ·  {rect[2] * rect[3] / 1e6:.1f} Mpx")
+        self.crop_changed.emit(rect)
+
+    def set_crop_rect(self, rect: Optional[Tuple[int, int, int, int]],
+                      from_drag: bool = False):
+        """
+        Pushes a crop rectangle into the numeric fields.
+
+        `from_drag` marks the one case that should also leave selection mode:
+        the user finished dragging on the image. Seeding defaults must not turn
+        the mode off, or enabling it would immediately cancel itself.
+        """
+        if rect is None:
+            self.chk_crop.setChecked(False)
+            return
+        self._loading_preset = True
+        try:
+            if not self.chk_crop.isChecked():
+                self.chk_crop.blockSignals(True)
+                self.chk_crop.setChecked(True)
+                self.chk_crop.blockSignals(False)
+                self._set_crop_controls_enabled(True)
+            for key, value in zip(("x", "y", "w", "h"), rect):
+                self.spin_crop[key].setValue(int(value))
+        finally:
+            self._loading_preset = False
+        self.lbl_crop_info.setText(
+            f"Ořez {rect[2]} × {rect[3]} px  ·  {rect[2] * rect[3] / 1e6:.1f} Mpx")
+        # Drawing is a one-shot gesture: drop back out of drag mode so the
+        # cropped preview is rendered straight away.
+        if from_drag and self.btn_crop_select.isChecked():
+            self.btn_crop_select.setChecked(False)
+
+    def get_crop_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        if not self.chk_crop.isChecked():
+            return None
+        w = self.spin_crop["w"].value()
+        h = self.spin_crop["h"].value()
+        if w < 16 or h < 16:
+            return None
+        return (self.spin_crop["x"].value(), self.spin_crop["y"].value(), w, h)
 
     def _build_corona_group(self) -> QGroupBox:
         group = QGroupBox("Potlačení šumu a korona")
@@ -353,4 +498,5 @@ class ControlsPanel(QWidget):
             'denoise': self.slider_denoise.value(),
             'coronal_boost': self.slider_coronal_boost.value(),
             'coronal_radius': self.slider_coronal_radius.value(),
+            'crop_rect': self.get_crop_rect(),
         }

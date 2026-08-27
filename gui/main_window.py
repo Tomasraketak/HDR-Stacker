@@ -27,7 +27,8 @@ from PyQt6.QtWidgets import (
 
 try:
     from core.exif_and_analysis import ExposureItem, estimate_stack_megapixels
-    from core.aligner import calculate_moon_shifts, apply_shifts_to_images, find_sun_or_moon_center
+    from core.aligner import (calculate_moon_shifts, apply_shifts_to_images,
+                              find_sun_or_moon_center, calculate_light_pattern_shifts)
     from core.merger import HDRMerger, HDRMergeError
     from core.postprocess import apply_postprocessing, save_image
     from core.image_cache import GLOBAL_IMAGE_CACHE, available_memory_bytes
@@ -39,7 +40,8 @@ try:
     from gui.ui_utils import fit_window_to_screen
 except ImportError:  # pragma: no cover
     from ..core.exif_and_analysis import ExposureItem, estimate_stack_megapixels
-    from ..core.aligner import calculate_moon_shifts, apply_shifts_to_images, find_sun_or_moon_center
+    from ..core.aligner import (calculate_moon_shifts, apply_shifts_to_images,
+                                find_sun_or_moon_center, calculate_light_pattern_shifts)
     from ..core.merger import HDRMerger, HDRMergeError
     from ..core.postprocess import apply_postprocessing, save_image
     from ..core.image_cache import GLOBAL_IMAGE_CACHE, available_memory_bytes
@@ -72,6 +74,24 @@ def _crop_to_rect(img: np.ndarray, rect: Tuple[int, int, int, int]) -> Tuple[np.
     rw = int(np.clip(rw, 1, w - rx))
     rh = int(np.clip(rh, 1, h - ry))
     return img[ry:ry + rh, rx:rx + rw], (rx, ry, rw, rh)
+
+
+def _apply_crop(img: np.ndarray, crop_rect: Optional[Tuple[int, int, int, int]],
+                scale: float = 1.0) -> np.ndarray:
+    """
+    Crops to `crop_rect`, which is expressed in ORIGINAL full-resolution pixels
+    and scaled here to match whatever proxy `img` actually is.
+
+    Cropping always happens AFTER alignment: warping a frame that has already
+    been cropped would pull border-replicated pixels in from the crop edge
+    instead of the real neighbouring image data.
+    """
+    if crop_rect is None:
+        return img
+    x, y, w, h = crop_rect
+    return _crop_to_rect(img, (int(round(x * scale)), int(round(y * scale)),
+                               max(1, int(round(w * scale))),
+                               max(1, int(round(h * scale)))))[0]
 
 
 class _CancellableWorker(QThread):
@@ -108,9 +128,11 @@ class StackingWorker(_CancellableWorker):
         settings: Dict[str, Any],
         scale: float = 0.25,
         roi_rect: Optional[Tuple[int, int, int, int]] = None,
+        crop_rect: Optional[Tuple[int, int, int, int]] = None,
         generation: int = 0,
     ):
         super().__init__(generation=generation)
+        self.crop_rect = crop_rect
         # Snapshot the per-frame state: the list widget may mutate its items
         # while this thread runs, and reading them from here would be a race.
         self.frames = [
@@ -121,6 +143,7 @@ class StackingWorker(_CancellableWorker):
         self.scale = float(np.clip(scale, 0.05, 1.0))
         self.roi_rect = roi_rect
         self.detected_shifts: Optional[List[Tuple[float, float]]] = None
+        self.align_report: str = ""
 
     def run(self):
         try:
@@ -146,7 +169,6 @@ class StackingWorker(_CancellableWorker):
 
         images: List[np.ndarray] = []
         times: List[float] = []
-        orig_w = orig_h = 0
         used_roi = self.roi_rect
 
         total = len(self.frames)
@@ -162,14 +184,6 @@ class StackingWorker(_CancellableWorker):
                 self.report_failure(f"Nelze načíst soubor: {path}")
                 return
 
-            if self.roi_rect is not None:
-                orig_h, orig_w = img.shape[:2]
-                img, used_roi = _crop_to_rect(img, self.roi_rect)
-            else:
-                # Recover the full size from the proxy and the scale we asked for.
-                orig_h = int(round(img.shape[0] / load_scale))
-                orig_w = int(round(img.shape[1] / load_scale))
-
             images.append(img)
             times.append(exp_time)
 
@@ -183,9 +197,27 @@ class StackingWorker(_CancellableWorker):
             if img.shape[:2] != (h0, w0):
                 images[i] = cv2.resize(img, (w0, h0), interpolation=cv2.INTER_AREA)
 
+        # Align on the uncropped frames, then crop: the other order would warp
+        # in replicated border pixels along the crop edge.
         images = self._align(images, load_scale)
         if self.cancelled():
             return
+
+        if self.crop_rect is not None:
+            self.emit_progress(68, "Aplikuji ořez na všechny expozice...")
+            images = [_apply_crop(im, self.crop_rect, load_scale) for im in images]
+
+        # The scene the viewer works in is whatever survived the crop.
+        scene_h, scene_w = images[0].shape[:2]
+        orig_h = int(round(scene_h / load_scale))
+        orig_w = int(round(scene_w / load_scale))
+
+        if self.roi_rect is not None:
+            cropped = []
+            for im in images:
+                patch, used_roi = _crop_to_rect(im, self.roi_rect)
+                cropped.append(patch)
+            images = cropped
 
         base_merged, hdr_radiance = self._merge(images, times)
         if self.cancelled():
@@ -208,13 +240,22 @@ class StackingWorker(_CancellableWorker):
             factor = 1.0 if self.roi_rect is not None else load_scale
             return apply_shifts_to_images(images, manual, scale_factor=factor)
 
-        if method == 'eclipse_disc':
-            self.emit_progress(45, "Hledám černý disk Měsíce v záři korony...")
-            shifts = calculate_moon_shifts(
-                images,
-                progress_callback=lambda p, m: self.emit_progress(45 + int(p * 0.2), m),
-                should_cancel=self.cancelled,
-            )
+        if method in ('eclipse_disc', 'static_lights'):
+            if method == 'static_lights':
+                self.emit_progress(45, "Hledám statická pouliční světla...")
+                shifts, match_counts = calculate_light_pattern_shifts(
+                    images,
+                    progress_callback=lambda p, m: self.emit_progress(45 + int(p * 0.2), m),
+                    should_cancel=self.cancelled,
+                )
+                self.align_report = self._describe_light_alignment(match_counts)
+            else:
+                self.emit_progress(45, "Hledám černý disk Měsíce v záři korony...")
+                shifts = calculate_moon_shifts(
+                    images,
+                    progress_callback=lambda p, m: self.emit_progress(45 + int(p * 0.2), m),
+                    should_cancel=self.cancelled,
+                )
             if self.cancelled():
                 return images
             # Shifts were measured in the pixel scale of `images`; report them
@@ -224,6 +265,28 @@ class StackingWorker(_CancellableWorker):
             return apply_shifts_to_images(images, shifts, scale_factor=1.0)
 
         return images
+
+    @staticmethod
+    def _describe_light_alignment(match_counts: List[int]) -> str:
+        """
+        Summarises how well the light pattern was matched, per frame.
+
+        A count of 0 means the frame could not be aligned at all and was left
+        untouched — the user needs to know which ones, because those are exactly
+        the frames worth nudging by hand.
+        """
+        total = len(match_counts)
+        confident = sum(1 for c in match_counts if c > 0)
+        weak = [i + 1 for i, c in enumerate(match_counts) if c == -1]
+        failed = [i + 1 for i, c in enumerate(match_counts) if c == 0]
+
+        parts = [f"💡 Zarovnáno podle světel: {confident}/{total} snímků spolehlivě"]
+        if weak:
+            parts.append("přibližně u č. " + ", ".join(map(str, weak)))
+        if failed:
+            parts.append("NEPODAŘILO SE u č. " + ", ".join(map(str, failed))
+                         + " — dolaďte je ručně (Ctrl+M)")
+        return "  ·  ".join(parts)
 
     def _merge(self, images, times) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         algo = self.settings.get('algo', 'mertens')
@@ -263,8 +326,10 @@ class FullResExportWorker(_CancellableWorker):
         settings: Dict[str, Any],
         export_filepath: str,
         export_scale: float = 1.0,
+        crop_rect: Optional[Tuple[int, int, int, int]] = None,
     ):
         super().__init__()
+        self.crop_rect = crop_rect
         self.frames = [
             (it.filepath, it.filename, float(it.exposure_time), float(it.shift_x), float(it.shift_y))
             for it in items
@@ -321,6 +386,16 @@ class FullResExportWorker(_CancellableWorker):
         if has_manual:
             self.emit_progress(42, "Aplikuji posuny v plném rozlišení...")
             images = apply_shifts_to_images(images, manual, scale_factor=self.export_scale)
+        elif self.settings.get('align_method') == 'static_lights':
+            self.emit_progress(42, "Zarovnávám podle statických světel v plném rozlišení...")
+            shifts, _counts = calculate_light_pattern_shifts(
+                images,
+                progress_callback=lambda p, m: self.emit_progress(42 + int(p * 0.15), m),
+                should_cancel=self.cancelled,
+            )
+            if self.cancelled():
+                return
+            images = apply_shifts_to_images(images, shifts, scale_factor=1.0)
         elif self.settings.get('align_method') == 'eclipse_disc':
             self.emit_progress(42, "Zarovnávám disk Měsíce v plném rozlišení...")
             shifts = calculate_moon_shifts(
@@ -334,6 +409,14 @@ class FullResExportWorker(_CancellableWorker):
 
         if self.cancelled():
             return
+
+        # Crop every exposure identically, after alignment.
+        if self.crop_rect is not None:
+            self.emit_progress(56, "Aplikuji ořez na všechny expozice...")
+            images = [_apply_crop(im, self.crop_rect, self.export_scale) for im in images]
+            if images[0].size == 0:
+                self.report_failure("Oříznutá oblast je prázdná. Zkontrolujte nastavení ořezu.")
+                return
 
         algo = self.settings.get('algo', 'mertens')
         hdr_radiance = None
@@ -439,6 +522,8 @@ class MainWindow(QMainWindow):
         self._stack_generation = 0
         self._roi_active = False
         self._roi_rect: Optional[Tuple[int, int, int, int]] = None
+        # User-defined output crop, in original full-resolution coordinates.
+        self._crop_rect: Optional[Tuple[int, int, int, int]] = None
 
         # Coalesces bursts of ROI drags / setting changes into one stacking run.
         self._restack_timer = QTimer(self)
@@ -471,6 +556,7 @@ class MainWindow(QMainWindow):
         self.viewer_container = ImageViewerContainer()
         self.viewer_container.roi_mode_toggled.connect(self._on_roi_mode_toggled)
         self.viewer_container.center_sun_requested.connect(self._center_roi_on_sun)
+        self.viewer_container.viewer.crop_selected.connect(self._on_crop_drawn)
         splitter.addWidget(self.viewer_container)
 
         self.controls = ControlsPanel()
@@ -478,6 +564,9 @@ class MainWindow(QMainWindow):
         self.controls.manual_align_requested.connect(self.open_manual_alignment)
         self.controls.live_adjust_requested.connect(self._apply_postprocessing_live)
         self.controls.merge_param_changed.connect(self.request_restack)
+        self.controls.crop_changed.connect(self._on_crop_changed)
+        self.controls.crop_select_requested.connect(self._on_crop_select_requested)
+        self.controls.crop_defaults_requested.connect(self._seed_default_crop)
         self.controls.export_requested.connect(self.export_result)
         splitter.addWidget(self.controls)
 
@@ -681,6 +770,112 @@ class MainWindow(QMainWindow):
             self.lbl_status.setText("Zobrazen celý snímek. Provádím složení plné scény...")
         self.request_restack()
 
+    # ------------------------------------------------------------------ Crop
+
+    def _on_crop_changed(self, rect: Optional[Tuple[int, int, int, int]]):
+        """The crop was enabled, disabled or edited numerically."""
+        self._crop_rect = tuple(rect) if rect else None
+        selecting = self.controls.btn_crop_select.isChecked()
+        if selecting or self._crop_rect is None:
+            self.viewer_container.viewer.set_crop_rect(self._crop_rect)
+        if self._crop_rect:
+            x, y, w, h = self._crop_rect
+            self.lbl_status.setText(
+                f"✂️ Ořez {w}×{h} px od [{x}, {y}] — použije se na všechny expozice i na export.")
+        else:
+            self.lbl_status.setText("Ořez vypnut — pracuje se s celým snímkem.")
+        if not selecting:
+            self.request_restack()
+
+    def _seed_default_crop(self):
+        """
+        Seeds the crop with the full frame when it is switched on with nothing set.
+        Starting from 0x0 would be an invalid state the user has to dig out of.
+        """
+        width, height = self._current_scene_size()
+        if width <= 0 or height <= 0:
+            self.lbl_status.setText(
+                "Ořez lze nastavit až po načtení fotek — nejdřív přidejte expozice.")
+            return
+        self.controls.set_crop_rect((0, 0, width, height))
+        self._crop_rect = (0, 0, width, height)
+        self._show_uncropped_reference()
+        self.viewer_container.viewer.set_crop_rect(self._crop_rect)
+        self.lbl_status.setText(
+            f"✂️ Ořez zapnut na celý snímek ({width}×{height} px). "
+            "Táhněte myší přes snímek nebo zadejte rozměry.")
+
+    def _on_crop_select_requested(self, active: bool):
+        """
+        Toggles drag-a-rectangle crop selection.
+
+        While selecting, the full uncropped frame is shown. Drawing a crop on an
+        already-cropped preview would define a crop relative to a crop, and the
+        overlay rectangle would no longer line up with what is on screen.
+        """
+        viewer = self.viewer_container.viewer
+        viewer.set_crop_select_mode(active)
+
+        if active:
+            # A restack queued or already running from the previous crop edit
+            # would land moments later and replace the full-frame reference —
+            # leaving the user composing against the wrong image.
+            self._restack_timer.stop()
+            self._retire_worker(self._worker)
+            self._worker = None
+            self._stack_generation += 1
+            self.progress_bar.setVisible(False)
+            self.controls.btn_stack.setEnabled(True)
+
+            self._show_uncropped_reference()
+            viewer.set_crop_rect(self._crop_rect)
+            self.lbl_status.setText(
+                "✂️ Táhněte myší přes snímek a vyberte oblast ořezu. "
+                "Zobrazen je celý needitovaný snímek.")
+        else:
+            # Back to the processed, cropped preview.
+            self.request_restack()
+
+    def _show_uncropped_reference(self):
+        """Displays the middle exposure at full frame, for composing the crop."""
+        active_items = self.exposure_list.get_active_items()
+        if not active_items:
+            return
+        img = GLOBAL_IMAGE_CACHE.get(active_items[len(active_items) // 2].filepath, 1.0)
+        if img is None:
+            return
+        h, w = img.shape[:2]
+        viewer = self.viewer_container.viewer
+        viewer.set_original_size(w, h)
+        viewer.set_base_image_bgr_uint8(img, keep_view=False)
+
+    def _on_crop_drawn(self, x: int, y: int, w: int, h: int):
+        """
+        The crop rectangle was set on the image (dragged, or set programmatically).
+
+        The viewer is refreshed explicitly rather than relying on it having drawn
+        the rectangle itself: that only holds for the drag path, and letting the
+        window and the viewer hold different rectangles is exactly the kind of
+        divergence that shows the user one crop and exports another.
+        """
+        self._crop_rect = (x, y, w, h)
+        self.controls.set_crop_rect(self._crop_rect, from_drag=True)
+        self.viewer_container.viewer.set_crop_rect(self._crop_rect)
+        if self.controls.btn_crop_select.isChecked():
+            self.lbl_status.setText(
+                f"✂️ Vybrán ořez {w}×{h} px. Vypněte „Vybrat oblast myší“ "
+                "pro náhled oříznutého výsledku.")
+        else:
+            self.lbl_status.setText(f"✂️ Ořez {w}×{h} px. Skládám náhled…")
+            self.request_restack()
+
+    def _current_scene_size(self) -> Tuple[int, int]:
+        """Full pixel size of the loaded frames, before any crop."""
+        for item in self.exposure_list.items:
+            if item.width > 0 and item.height > 0:
+                return item.width, item.height
+        return 0, 0
+
     def _on_manual_shifts_applied(self):
         self.lbl_status.setText("Manuální posuny uloženy. Spouštím složení...")
         self.exposure_list.refresh_table()
@@ -754,6 +949,7 @@ class MainWindow(QMainWindow):
         worker = StackingWorker(items, settings,
                                 scale=settings.get('proxy_scale', 0.25),
                                 roi_rect=roi,
+                                crop_rect=self._crop_rect,
                                 generation=self._stack_generation)
         worker.progress.connect(self._on_worker_progress)
         worker.finished_success.connect(self._on_stacking_success)
@@ -769,6 +965,10 @@ class MainWindow(QMainWindow):
                              used_roi, generation: int):
         if generation != self._stack_generation:
             return  # a newer run has already superseded this result
+
+        if self.controls.btn_crop_select.isChecked():
+            # Composing a crop: the viewer must keep showing the full frame.
+            return
 
         self.controls.btn_stack.setEnabled(True)
         self.controls.btn_export.setEnabled(True)
@@ -787,6 +987,13 @@ class MainWindow(QMainWindow):
         if orig_w > 0 and orig_h > 0:
             self.viewer_container.viewer.set_original_size(orig_w, orig_h)
 
+        # The preview now *is* the cropped region, so its own coordinate space
+        # starts at the crop corner. Drawing the crop rectangle on top of it
+        # would place the marker at the wrong offset. While the user is still
+        # composing the crop the marker is what they are aiming with, so it stays.
+        if not self.controls.btn_crop_select.isChecked():
+            self.viewer_container.viewer.set_crop_rect(None)
+
         self._base_merged_bgr = base_bgr
         self._hdr_radiance_map = hdr_radiance
         self._preview_base_bgr = self._downscale_for_preview(base_bgr)
@@ -804,7 +1011,10 @@ class MainWindow(QMainWindow):
 
         self._apply_postprocessing_live()
 
-        if self._roi_active and self._roi_rect is not None:
+        report = worker.align_report if isinstance(worker, StackingWorker) else ""
+        if report:
+            self.lbl_status.setText(report)
+        elif self._roi_active and self._roi_rect is not None:
             self.lbl_status.setText(
                 f"⚡ Výřez {self._roi_rect[2]}x{self._roi_rect[3]} px složen. "
                 "Kliknutím do fotky ho přesunete."
@@ -934,7 +1144,8 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.lbl_status.setText(f"Probíhá výpočet a export do {os.path.basename(filepath)}...")
 
-        worker = FullResExportWorker(items, self.controls.get_settings(), filepath, export_scale)
+        worker = FullResExportWorker(items, self.controls.get_settings(), filepath,
+                                     export_scale, crop_rect=self._crop_rect)
         worker.progress.connect(self._on_worker_progress)
         worker.finished_success.connect(self._on_export_success)
         worker.failed.connect(self._on_export_failed)

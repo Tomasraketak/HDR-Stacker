@@ -27,6 +27,8 @@ from core.exif_and_analysis import (
 from core.aligner import (
     detect_black_circle_in_light, calculate_moon_shifts,
     apply_shifts_to_images, find_sun_or_moon_center,
+    detect_point_lights, estimate_translation_from_points,
+    calculate_light_pattern_shifts,
 )
 from core.merger import HDRMerger, HDRMergeError, sanitize_exposure_times
 from core.postprocess import (
@@ -89,6 +91,131 @@ def generate_synthetic_eclipse_exposures(output_dir: str, num_exposures: int = 9
         cv2.imwrite(path, bgr)
         paths.append(path)
     return paths
+
+
+def generate_lamp_scene_bracket(num_exposures: int = 9, shake: float = 6.0,
+                                ground_gain: float = 0.35, n_lamps: int = 24,
+                                seed: int = 7):
+    """
+    A totality frame over a landscape: corona at the top, a horizon of static
+    street lamps at the bottom, and random camera shake between exposures.
+
+    Returns (images, true_shifts_to_reference, ref_idx).
+    """
+    h, w = 900, 1400
+    rng = np.random.default_rng(seed)
+    y, x = np.ogrid[:h, :w]
+    cy, cx = int(h * 0.32), w // 2
+    r = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+
+    moon = 60.0
+    corona = np.where(r <= moon, 0.0, 1.0 / np.maximum(r - moon, 1.0) ** 0.85)
+    angle = np.arctan2(y - cy, x - cx)
+    corona = corona * (1 + 0.35 * np.sin(6 * angle) + 0.25 * np.cos(13 * angle))
+
+    lamps = np.zeros((h, w), np.float32)
+    for _ in range(n_lamps):
+        lx = rng.uniform(w * 0.02, w * 0.98)
+        ly = rng.uniform(h * 0.62, h * 0.95)
+        lamps[int(ly), int(lx)] = rng.uniform(3.0, 9.0)
+    lamps = cv2.GaussianBlur(lamps, (0, 0), 1.6)
+
+    ground = np.zeros((h, w), np.float32)
+    ground[int(h * 0.60):, :] = 0.012
+
+    images, offsets = [], []
+    ref_idx = num_exposures // 2
+    for i in range(num_exposures):
+        t = (1 / 4000.0) * (2.0 ** i)
+        s = t * 3000.0
+        frame = corona * s + lamps * (s * 0.9) + ground * (s * ground_gain)
+        frame = frame + rng.normal(0, 0.0025, frame.shape)
+        bgr = np.dstack([np.clip(frame * 240, 0, 255),
+                         np.clip(frame * 245, 0, 255),
+                         np.clip(frame * 255, 0, 255)]).astype(np.uint8)
+
+        dx = 0.0 if i == ref_idx else rng.uniform(-shake, shake)
+        dy = 0.0 if i == ref_idx else rng.uniform(-shake, shake)
+        offsets.append((dx, dy))
+        images.append(cv2.warpAffine(bgr, np.float32([[1, 0, dx], [0, 1, dy]]), (w, h),
+                                     flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE))
+
+    truth = [(offsets[ref_idx][0] - dx, offsets[ref_idx][1] - dy) for dx, dy in offsets]
+    return images, truth, ref_idx
+
+
+def test_static_light_alignment():
+    section("2b. Static street-light pattern alignment")
+
+    images, truth, ref_idx = generate_lamp_scene_bracket()
+
+    points = detect_point_lights(images[ref_idx])
+    check(len(points) >= 10, f"lamps must be detected in the reference frame (got {len(points)})")
+    check(points.shape[1] == 3, "detections must be (x, y, brightness)")
+    h, w = images[ref_idx].shape[:2]
+    check(bool(np.all(points[:, 1] > h * 0.4)),
+          "the default search band must stay below the Sun")
+    check(bool(np.all(np.diff(points[:, 2]) <= 1e-3)), "detections must be brightest-first")
+
+    # A pure translation must be recovered exactly.
+    shifted = np.column_stack([points[:, 0] - 7.25, points[:, 1] + 3.5, points[:, 2]])
+    recovered = estimate_translation_from_points(points, shifted)
+    check(recovered is not None, "a synthetic translation must be recovered")
+    if recovered:
+        check(abs(recovered[0] - 7.25) < 0.2 and abs(recovered[1] + 3.5) < 0.2,
+              f"recovered translation must be accurate (got {recovered[:2]})")
+
+    # Half the lamps missing, plus decoys: the constellation vote must still win.
+    partial = shifted[::2]
+    decoys = np.column_stack([
+        np.random.default_rng(3).uniform(0, w, 8),
+        np.random.default_rng(4).uniform(h * 0.5, h, 8),
+        np.full(8, 5.0)])
+    noisy = np.vstack([partial, decoys]).astype(np.float32)
+    robust = estimate_translation_from_points(points, noisy)
+    check(robust is not None and abs(robust[0] - 7.25) < 0.5 and abs(robust[1] + 3.5) < 0.5,
+          "matching must survive missing lamps and spurious detections")
+
+    # Full-bracket accuracy against ground truth.
+    shifts, matches = calculate_light_pattern_shifts(images)
+    check(len(shifts) == len(images), "one shift per frame")
+    errors = [np.hypot(sx - tx, sy - ty) for (sx, sy), (tx, ty) in zip(shifts, truth)]
+    confident = [e for e, m in zip(errors, matches) if m > 0]
+    check(len(confident) >= len(images) - 2,
+          f"most frames must align confidently ({len(confident)}/{len(images)})")
+    check(float(np.median(confident)) < 0.5,
+          f"confident alignments must be subpixel (median {np.median(confident):.3f} px)")
+    print(f"   {len(confident)}/{len(images)} frames confident, "
+          f"median error {np.median(confident):.3f} px")
+
+    # It must beat disc alignment on this scene, which is the whole point.
+    moon_shifts = calculate_moon_shifts(images)
+    moon_errors = [np.hypot(sx - tx, sy - ty) for (sx, sy), (tx, ty) in zip(moon_shifts, truth)]
+    print(f"   lunar-disc alignment on the same scene: "
+          f"median {np.median(moon_errors):.3f} px")
+    check(float(np.median(confident)) < float(np.median(moon_errors)),
+          "light-pattern alignment must beat disc alignment when a fixed foreground exists")
+
+    # A tripod-steady bracket must produce essentially zero shift.
+    steady, steady_truth, _ = generate_lamp_scene_bracket(shake=0.0)
+    steady_shifts, steady_matches = calculate_light_pattern_shifts(steady)
+    steady_err = [np.hypot(sx - tx, sy - ty)
+                  for (sx, sy), (tx, ty), m in zip(steady_shifts, steady_truth, steady_matches)
+                  if m > 0]
+    check(float(np.max(steady_err)) < 0.5,
+          f"a steady bracket must not be moved (max {np.max(steady_err):.3f} px)")
+
+    # A frame with no usable pattern must be left alone, never guessed at.
+    blank = [np.zeros((300, 400, 3), np.uint8) for _ in range(3)]
+    blank_shifts, blank_matches = calculate_light_pattern_shifts(blank)
+    check(all(s == (0.0, 0.0) for s in blank_shifts),
+          "a featureless bracket must produce no shifts")
+    check(all(m <= 0 for m in blank_matches), "a featureless bracket must report no matches")
+
+    check(len(detect_point_lights(None)) == 0, "None input must return no detections")
+    check(estimate_translation_from_points(points[:2], points[:2]) is None,
+          "too few points must return None rather than a bogus translation")
+    check(calculate_light_pattern_shifts([]) == ([], []), "an empty stack is handled")
 
 
 # ------------------------------------------------------------------ Core tests
@@ -503,6 +630,112 @@ def test_gui(paths):
           f"in a {dlg.width()}x{dlg.height()} dialog)")
     dlg.reject()
 
+    # (f3) Output crop: same rectangle on every exposure, preview and export.
+    from gui.main_window import _apply_crop, StackingWorker as SW
+
+    probe = np.arange(120 * 200 * 3, dtype=np.uint8).reshape(120, 200, 3)
+    cropped = _apply_crop(probe, (40, 20, 60, 50), scale=1.0)
+    check(cropped.shape[:2] == (50, 60), "crop must produce the requested size")
+    check(np.array_equal(cropped, probe[20:70, 40:100]),
+          "crop must take the requested region, not an offset one")
+    half = _apply_crop(probe, (40, 20, 60, 50), scale=0.5)
+    check(half.shape[:2] == (25, 30), "crop must scale with the working proxy")
+    check(_apply_crop(probe, None).shape == probe.shape, "no crop rect is a pass-through")
+    huge = _apply_crop(probe, (150, 100, 500, 500), scale=1.0)
+    check(huge.shape[0] > 0 and huge.shape[1] > 0,
+          "a crop reaching past the edge must clamp, not produce an empty image")
+
+    window.controls.chk_crop.setChecked(True)
+    pump(300)
+    seeded = window.controls.get_crop_rect()
+    check(seeded is not None and seeded[2] == 400 and seeded[3] == 400,
+          f"enabling the crop must seed it from the real frame size (got {seeded})")
+
+    for key, value in (("x", 80), ("y", 60), ("w", 240), ("h", 180)):
+        window.controls.spin_crop[key].setValue(value)
+    pump(200)
+    check(window._crop_rect == (80, 60, 240, 180),
+          f"numeric crop edits must reach the window (got {window._crop_rect})")
+
+    window._run_stacking()
+    pump(15000, until=lambda: window._base_merged_bgr is not None
+         and window._base_merged_bgr.shape[:2] == (45, 60))
+    merged_shape = window._base_merged_bgr.shape[:2] if window._base_merged_bgr is not None else None
+    check(merged_shape == (45, 60),
+          f"the preview must be the cropped region at proxy scale (got {merged_shape})")
+
+    # Crop selection state machine: turning the mode on shows the full frame
+    # with a marker; drawing exits the mode; the finished preview drops the
+    # marker because the scene has become the crop itself.
+    viewer = window.viewer_container.viewer
+    window.controls.btn_crop_select.setChecked(True)
+    pump(600)
+    check(window.controls.btn_crop_select.isChecked(),
+          "seeding defaults must not cancel the selection mode that triggered it")
+    check(viewer.get_crop_rect() is not None,
+          "the crop marker must be visible while composing")
+    check(viewer._scene_size() == (400, 400),
+          f"composing must show the full uncropped frame (got {viewer._scene_size()})")
+
+    window._on_crop_drawn(60, 40, 260, 200)
+    check(not window.controls.btn_crop_select.isChecked(),
+          "drawing a crop must leave selection mode")
+    check(viewer.get_crop_rect() == (60, 40, 260, 200),
+          "the drawn rectangle must be shown")
+    pump(15000, until=lambda: viewer._scene_size() == (260, 200))
+    check(viewer._scene_size() == (260, 200),
+          f"the finished preview scene must be the crop (got {viewer._scene_size()})")
+    check(viewer.get_crop_rect() is None,
+          "the marker must be dropped once the preview is itself the crop")
+
+    # Drawing on the image must feed straight back into the controls.
+    window._on_crop_drawn(10, 20, 300, 200)
+    check(window.controls.get_crop_rect() == (10, 20, 300, 200),
+          "a crop drawn on the image must update the numeric fields")
+    check(window.viewer_container.viewer.get_crop_rect() == (10, 20, 300, 200),
+          "the viewer must show the crop it was given")
+
+    # A cropped full-resolution export must come out at exactly the crop size.
+    from gui.main_window import FullResExportWorker as FEW
+    crop_out = os.path.join(os.path.dirname(paths[0]), "crop_export.tif")
+    crop_worker = FEW(window.exposure_list.get_active_items(),
+                      window.controls.get_settings(), crop_out,
+                      export_scale=1.0, crop_rect=(10, 20, 300, 200))
+    crop_errors, crop_done = [], []
+    crop_worker.failed.connect(crop_errors.append)
+    crop_worker.finished_success.connect(crop_done.append)
+    crop_worker.start()
+    crop_worker.wait(120000)
+    pump(2000, until=lambda: bool(crop_done or crop_errors))
+    check(not crop_errors, f"cropped export must not fail: {crop_errors}")
+    if os.path.exists(crop_out):
+        written = imread_unicode(crop_out, cv2.IMREAD_UNCHANGED)
+        check(written is not None and written.shape[:2] == (200, 300),
+              f"cropped export must be exactly the crop size "
+              f"(got {None if written is None else written.shape[:2]})")
+        print(f"   cropped export: {written.shape[1]}x{written.shape[0]} px at full resolution")
+
+    # Alignment must run before the crop, otherwise the warp drags replicated
+    # border pixels in along the crop edge.
+    shifted_items = list(window.exposure_list.get_active_items())
+    for it in shifted_items:
+        it.shift_x, it.shift_y = 12.0, 8.0
+    order_worker = SW(shifted_items, window.controls.get_settings(),
+                      scale=1.0, crop_rect=(120, 120, 160, 160))
+    order_results = []
+    order_worker.finished_success.connect(lambda *a: order_results.append(a[0]))
+    order_worker.start()
+    order_worker.wait(60000)
+    pump(2000, until=lambda: bool(order_results))
+    check(bool(order_results) and order_results[0].shape[:2] == (160, 160),
+          "align-then-crop must still yield exactly the crop size")
+    for it in shifted_items:
+        it.shift_x, it.shift_y = 0.0, 0.0
+
+    window.controls.chk_crop.setChecked(False)
+    pump(300)
+    check(window._crop_rect is None, "disabling the crop must clear it everywhere")
+
     # (g) End-to-end export through the real worker, including alignment,
     #     fusion, post-processing and the 16-bit write.
     from gui.main_window import FullResExportWorker
@@ -553,6 +786,7 @@ def run_all_tests() -> int:
 
         items = test_exposure_analysis(tmpdir, paths)
         _images, aligned = test_detection_and_alignment(items)
+        test_static_light_alignment()
         fusion, hdr = test_merging(aligned, items)
         enhanced = test_postprocessing(fusion)
         test_export(tmpdir, enhanced, hdr)

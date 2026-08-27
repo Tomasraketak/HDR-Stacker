@@ -47,6 +47,7 @@ class InteractiveImageViewer(QWidget):
 
     pixel_hovered = pyqtSignal(int, int, int, int, int)   # x, y, r, g, b
     roi_selected = pyqtSignal(int, int, int, int)          # x, y, w, h in scene coords
+    crop_selected = pyqtSignal(int, int, int, int)         # x, y, w, h in scene coords
 
     MIN_ZOOM = 0.02
     MAX_ZOOM = 40.0
@@ -77,6 +78,12 @@ class InteractiveImageViewer(QWidget):
         self._roi_enabled: bool = False
         self._roi_size: int = 300
         self._is_dragging_roi: bool = False
+
+        # Output crop: applied to every exposure and to the export.
+        self._crop_rect: Optional[QRect] = None
+        self._crop_select_mode: bool = False
+        self._crop_drag_origin: Optional[Tuple[int, int]] = None
+        self._crop_drag_current: Optional[Tuple[int, int]] = None
 
         self._show_histogram: bool = False
         self._histogram: Optional[np.ndarray] = None   # shape (3, 128), normalised
@@ -218,6 +225,37 @@ class InteractiveImageViewer(QWidget):
         self._needs_fit = False
         self.update()
 
+    # ------------------------------------------------------------- Output crop
+
+    def set_crop_rect(self, rect: Optional[Tuple[int, int, int, int]]):
+        self._crop_rect = QRect(*[int(v) for v in rect]) if rect else None
+        self.update()
+
+    def get_crop_rect(self) -> Optional[Tuple[int, int, int, int]]:
+        if self._crop_rect is None:
+            return None
+        r = self._crop_rect
+        return (r.x(), r.y(), r.width(), r.height())
+
+    def set_crop_select_mode(self, enabled: bool):
+        self._crop_select_mode = bool(enabled)
+        self._crop_drag_origin = None
+        self._crop_drag_current = None
+        self.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def _clamp_to_scene(self, x: int, y: int) -> Tuple[int, int]:
+        w, h = self._scene_size()
+        return int(np.clip(x, 0, max(0, w - 1))), int(np.clip(y, 0, max(0, h - 1)))
+
+    def _pending_crop(self) -> Optional[QRect]:
+        """The rectangle currently being dragged, normalised so w/h are positive."""
+        if self._crop_drag_origin is None or self._crop_drag_current is None:
+            return None
+        x0, y0 = self._crop_drag_origin
+        x1, y1 = self._crop_drag_current
+        return QRect(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+
     # -------------------------------------------------------- Comparison mode
 
     def set_compare_image_bgr_float(self, img_bgr_f32: np.ndarray):
@@ -303,6 +341,9 @@ class InteractiveImageViewer(QWidget):
         dest = self._dest_rect()
         self._paint_image(painter, dest)
 
+        if self._crop_rect is not None or self._crop_select_mode:
+            self._paint_crop(painter, dest)
+
         if self._roi_enabled and self._roi_rect is not None:
             self._paint_roi(painter, dest)
 
@@ -380,6 +421,49 @@ class InteractiveImageViewer(QWidget):
         painter.drawPath(path)
         painter.setPen(colour)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+    def _scene_rect_to_screen(self, rect: QRect, dest: QRectF) -> QRectF:
+        return QRectF(
+            dest.left() + rect.x() * self._zoom,
+            dest.top() + rect.y() * self._zoom,
+            rect.width() * self._zoom,
+            rect.height() * self._zoom,
+        )
+
+    def _paint_crop(self, painter: QPainter, dest: QRectF):
+        """Draws the output crop: what falls outside is what will be discarded."""
+        pending = self._pending_crop()
+        rect = pending if pending is not None else self._crop_rect
+        if rect is None or rect.width() < 1 or rect.height() < 1:
+            return
+
+        screen = self._scene_rect_to_screen(rect, dest)
+        colour = QColor("#f59e0b")   # amber: distinct from the cyan ROI
+
+        # Everything outside the crop is dimmed hard — it is being thrown away.
+        painter.save()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(2, 4, 8, 175))
+        outside = QPainterPath()
+        outside.addRect(dest)
+        inner = QPainterPath()
+        inner.addRect(screen)
+        painter.drawPath(outside.subtracted(inner))
+        painter.restore()
+
+        painter.setPen(QPen(colour, 1.6, Qt.PenStyle.DashLine))
+        painter.drawRect(screen)
+
+        # Rule-of-thirds guides help judge the composition while dragging.
+        painter.setPen(QPen(QColor(245, 158, 11, 90), 1, Qt.PenStyle.DotLine))
+        for i in (1, 2):
+            fx = screen.left() + screen.width() * i / 3.0
+            fy = screen.top() + screen.height() * i / 3.0
+            painter.drawLine(QPointF(fx, screen.top()), QPointF(fx, screen.bottom()))
+            painter.drawLine(QPointF(screen.left(), fy), QPointF(screen.right(), fy))
+
+        self._draw_tag(painter, QPointF(screen.left(), max(2.0, screen.top() - 26)),
+                       f"✂️ Ořez {rect.width()}×{rect.height()} px", colour)
 
     def _paint_roi(self, painter: QPainter, dest: QRectF):
         r = self._roi_rect
@@ -492,6 +576,13 @@ class InteractiveImageViewer(QWidget):
 
     # ----------------------------------------------------- Mouse & navigation
 
+    def _screen_to_scene_unclamped(self, pos: QPointF) -> Tuple[int, int]:
+        """Scene coordinates without a bounds check — callers clamp as needed."""
+        if self._zoom <= 0:
+            return 0, 0
+        return (int((pos.x() - self._pan_pos.x()) / self._zoom),
+                int((pos.y() - self._pan_pos.y()) / self._zoom))
+
     def _screen_to_image_coords(self, pos: QPointF) -> Optional[Tuple[int, int]]:
         """Converts a widget position to scene (full-image) coordinates."""
         if self._base_image_rgb is None or self._zoom <= 0:
@@ -521,6 +612,13 @@ class InteractiveImageViewer(QWidget):
     def mousePressEvent(self, event: QMouseEvent):
         pos = event.position()
 
+        if event.button() == Qt.MouseButton.LeftButton and self._crop_select_mode:
+            raw = self._screen_to_scene_unclamped(pos)
+            self._crop_drag_origin = self._clamp_to_scene(*raw)
+            self._crop_drag_current = self._crop_drag_origin
+            self.update()
+            return
+
         if event.button() == Qt.MouseButton.LeftButton and self._roi_enabled:
             coords = self._screen_to_image_coords(pos)
             if coords is not None:
@@ -536,6 +634,14 @@ class InteractiveImageViewer(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent):
         pos = event.position()
+
+        if self._crop_select_mode and self._crop_drag_origin is not None:
+            # Clamped, not rejected: dragging past the image edge should pin the
+            # crop to that edge rather than stop tracking the mouse.
+            self._crop_drag_current = self._clamp_to_scene(*self._screen_to_scene_unclamped(pos))
+            self.update()
+            self._emit_hover(pos)
+            return
 
         if self._is_dragging_roi and self._roi_enabled:
             coords = self._screen_to_image_coords(pos)
@@ -566,6 +672,18 @@ class InteractiveImageViewer(QWidget):
         self.pixel_hovered.emit(img_x, img_y, int(r), int(g), int(b))
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton and self._crop_select_mode:
+            pending = self._pending_crop()
+            self._crop_drag_origin = None
+            self._crop_drag_current = None
+            # Ignore an accidental click: a crop needs real area to be meaningful.
+            if pending is not None and pending.width() >= 16 and pending.height() >= 16:
+                self._crop_rect = pending
+                self.crop_selected.emit(pending.x(), pending.y(),
+                                        pending.width(), pending.height())
+            self.update()
+            return
+
         if event.button() == Qt.MouseButton.LeftButton:
             self._is_dragging_roi = False
         if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton,
