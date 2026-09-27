@@ -35,6 +35,8 @@ try:
     from core.project import (Project, ProjectError, PROJECT_EXTENSION, PROJECT_FILTER,
                               build_project, save_project, load_project,
                               resolved_paths, apply_frame_records)
+    from core.eclipse_composite import CompositeSettings
+    from gui.eclipse_composite_window import EclipseCompositeWindow
     from gui.exposure_list_widget import ExposureListWidget
     from gui.image_viewer import ImageViewerContainer
     from gui.controls_panel import ControlsPanel
@@ -51,6 +53,8 @@ except ImportError:  # pragma: no cover
     from ..core.project import (Project, ProjectError, PROJECT_EXTENSION, PROJECT_FILTER,
                                 build_project, save_project, load_project,
                                 resolved_paths, apply_frame_records)
+    from ..core.eclipse_composite import CompositeSettings
+    from .eclipse_composite_window import EclipseCompositeWindow
     from .exposure_list_widget import ExposureListWidget
     from .image_viewer import ImageViewerContainer
     from .controls_panel import ControlsPanel
@@ -550,6 +554,11 @@ class MainWindow(QMainWindow):
         # User-defined output crop, in original full-resolution coordinates.
         self._crop_rect: Optional[Tuple[int, int, int, int]] = None
 
+        # The partial-phase sequence composite lives beside the HDR stack and is
+        # saved in the same project file.
+        self._composite_settings = CompositeSettings()
+        self._composite_window: Optional[EclipseCompositeWindow] = None
+
         # Coalesces bursts of ROI drags / setting changes into one stacking run.
         self._restack_timer = QTimer(self)
         self._restack_timer.setSingleShot(True)
@@ -596,6 +605,7 @@ class MainWindow(QMainWindow):
         self.controls.crop_select_requested.connect(self._on_crop_select_requested)
         self.controls.crop_defaults_requested.connect(self._seed_default_crop)
         self.controls.export_requested.connect(self.export_result)
+        self.controls.composite_requested.connect(self.open_eclipse_composite)
         splitter.addWidget(self.controls)
 
         splitter.setStretchFactor(0, 2)
@@ -672,6 +682,11 @@ class MainWindow(QMainWindow):
         add(file_menu, "&Exportovat výsledek…", self.export_result, "Ctrl+E")
         file_menu.addSeparator()
         add(file_menu, "&Konec", self.close, "Ctrl+Q")
+
+        tools_menu = menubar.addMenu("&Nástroje")
+        add(tools_menu, "🌗 Časosběrný &kompozit zatmění…", self.open_eclipse_composite, "Ctrl+T",
+            "Složí fotky částečných fází do snímku úplného zatmění podle skutečné dráhy Slunce.")
+        add(tools_menu, "🛠️ &Ruční dozarovnání…", self.open_manual_alignment, None)
 
         self._refresh_recent_action()
 
@@ -766,6 +781,9 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+        if not self._close_composite_window():
+            event.ignore()
+            return
         self._wait_for_all_workers()
         self._autosave_session()
         GLOBAL_IMAGE_CACHE.invalidate()
@@ -871,7 +889,54 @@ class MainWindow(QMainWindow):
             preset_name=self.controls.combo_preset.currentText(),
             compare_mode=self.viewer_container.btn_split.isChecked(),
             histogram_visible=self.viewer_container.btn_hist.isChecked(),
+            eclipse_composite=self._composite_payload(),
         )
+
+    def _composite_payload(self) -> Dict[str, Any]:
+        """The composite's settings, or {} while it has never been used."""
+        s = self._composite_settings
+        return s.to_dict() if (s.background_path or s.frames) else {}
+
+    def _has_session_content(self) -> bool:
+        return bool(self.exposure_list.items) or bool(self._composite_payload())
+
+    # ------------------------------------------------------------- Composite
+
+    def open_eclipse_composite(self):
+        """
+        Opens the partial-phase sequence composite editor.
+
+        A closed editor is kept and simply shown again, so its decoded
+        background and Sun cut-outs do not have to be recomputed.
+        """
+        window = self._composite_window
+        if window is None:
+            window = EclipseCompositeWindow(self._composite_settings, parent=self)
+            self._composite_window = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _close_composite_window(self, force: bool = False) -> bool:
+        """
+        Closes and discards the composite editor.
+
+        Returns False when the user chose to keep it open (an export is running).
+        """
+        window = self._composite_window
+        if window is None:
+            return True
+        if force:
+            window.done(0)
+        elif window.isVisible() and not window.close():
+            return False
+        window.stop_tasks()
+        # Deleting the window would destroy its QThreads; one still unwinding
+        # keeps the window alive (parented to us) rather than crashing the app.
+        if not window.busy():
+            window.deleteLater()
+        self._composite_window = None
+        return True
 
     def new_project(self):
         self._restack_timer.stop()
@@ -880,6 +945,8 @@ class MainWindow(QMainWindow):
         self._stack_generation += 1
 
         self.exposure_list.clear_all()
+        self._close_composite_window(force=True)
+        self._composite_settings = CompositeSettings()
         self.controls.chk_crop.setChecked(False)
         self.viewer_container.btn_roi_toggle.setChecked(False)
         self.controls.reset_adjustments()
@@ -900,13 +967,16 @@ class MainWindow(QMainWindow):
             self.save_project_as()
 
     def save_project_as(self):
-        if not self.exposure_list.items:
+        if not self._has_session_content():
             QMessageBox.information(self, "Prázdný projekt",
                                     "Nejdřív načtěte fotky, které chcete uložit.")
             return
+        first = (self.exposure_list.items[0].filepath if self.exposure_list.items
+                 else self._composite_settings.background_path
+                 or (self._composite_settings.frames[0].path
+                     if self._composite_settings.frames else ""))
         suggested = self._project_path or os.path.join(
-            os.path.dirname(self.exposure_list.items[0].filepath),
-            "zatmeni_projekt" + PROJECT_EXTENSION)
+            os.path.dirname(first), "zatmeni_projekt" + PROJECT_EXTENSION)
         filepath, _ = QFileDialog.getSaveFileName(
             self, "Uložit projekt", suggested, PROJECT_FILTER)
         if filepath:
@@ -945,7 +1015,7 @@ class MainWindow(QMainWindow):
         if not self._autorestore_enabled():
             return
         session = self._session_file()
-        if os.path.isfile(session) and not self.exposure_list.items:
+        if os.path.isfile(session) and not self._has_session_content():
             self._load_project_file(session, remember_path=False, quiet=True)
 
     def _load_project_file(self, filepath: str, remember_path: bool,
@@ -959,7 +1029,8 @@ class MainWindow(QMainWindow):
             return False
 
         found = resolved_paths(project, filepath)
-        if not found:
+        has_composite = bool(project.eclipse_composite)
+        if not found and not has_composite:
             message = ("Žádnou z fotek uložených v projektu se nepodařilo najít.\n\n"
                        "Fotky byly zřejmě přesunuty nebo smazány. Projekt ukládá jen "
                        "cesty k souborům, ne samotné fotografie.")
@@ -977,8 +1048,11 @@ class MainWindow(QMainWindow):
         # Order matters: load the frames, restore their per-frame state, then the
         # settings, and only then trigger a single stack.
         self.exposure_list.clear_all()
+        self._close_composite_window(force=True)
+        self._composite_settings = CompositeSettings.from_dict(project.eclipse_composite)
         self.exposure_list.spin_ev_step.setValue(project.ev_step)
-        self.exposure_list.load_files(found)
+        if found:
+            self.exposure_list.load_files(found)
         matched = apply_frame_records(project, self.exposure_list.items, filepath)
         self.exposure_list.refresh_table()
 
@@ -1013,6 +1087,9 @@ class MainWindow(QMainWindow):
                       if abs(it.shift_x) > 0.01 or abs(it.shift_y) > 0.01)
         summary = (f"📂 Načteno {len(found)} snímků, obnoveno zarovnání u {matched} z nich "
                    f"({shifted} s posunem) a všechna nastavení.")
+        if has_composite:
+            summary += (f"  🌗 Časosběrný kompozit: {len(self._composite_settings.frames)} "
+                        "částečných fází (Ctrl+T).")
         if missing:
             summary += f"  ⚠ Chybí {len(missing)} souborů."
             if not quiet:
@@ -1035,7 +1112,7 @@ class MainWindow(QMainWindow):
 
     def _autosave_session(self):
         """Snapshots the session on exit so it can be picked up next time."""
-        if not self._session_persistence or not self.exposure_list.items:
+        if not self._session_persistence or not self._has_session_content():
             return
         session = self._session_file()
         try:

@@ -122,6 +122,45 @@ ručně vyvolat přes **`Obnovit poslední relaci`**.
 a uloží ho jako **16bitový TIFF**, **JPEG**, **16bitový PNG** nebo **32bitový Radiance HDR**.
 Náhled je záměrně zmenšený kvůli rychlosti — na kvalitu exportu to nemá vliv.
 
+### 8. Časosběrný kompozit zatmění (volitelné)
+Klasický snímek, kde nad krajinou visí řada Sluncí a Měsíc je postupně „ukusuje“, až nastane
+úplné zatmění, a pak zase odchází. Otevřete ho přes **`🌗 Časosběr zatmění`** v pravém panelu
+nebo **`Nástroje → Časosběrný kompozit zatmění`** (`Ctrl+T`).
+
+1. **Pozadí** — načtěte už složenou (stacknutou) fotku úplné fáze, třeba 16bitový TIFF
+   exportovaný tímto programem. Program sám najde disk Měsíce v koróně (střed i průměr).
+   Čas snímku se čte z EXIF; stack z tohoto programu EXIF nemá, takže klikněte na
+   **`🕑 Převzít čas z EXIF jiné fotky`** a vyberte jednu z původních expozic úplné fáze.
+   Nastavte časové pásmo (letní čas = UTC+2) a místo — z GPS v EXIF, z nabídky měst na pásu
+   totality 12. 8. 2026, nebo souřadnicemi.
+2. **Kalibrace** — klikněte na **`〰 Vyznačit horizont`** a táhněte myší podél vzdáleného
+   obzoru (co nejdelší úsečka). Slunce je předvyplněné; když ne, **`☀ Vyznačit Slunce`**:
+   klik do středu disku a tah k okraji. Z toho program spočítá model fotoaparátu — měřítko
+   (px na stupeň), náklon i směr — a ukáže, jak dobře průměr Slunce a horizont souhlasí.
+   Pokud jste fotili z kopce, nastavte **Výšku horizontu** do minusu (100 m ≈ −0,3°).
+3. **Částečné fáze** — **`+ Přidat snímky s filtrem`**. U každé fotky se najde sluneční
+   disk (i z tenkého srpku — kružnice se proloží vnějším okrajem Slunce), vyřízne se a podle
+   **času z EXIF** se umístí přesně tam, kde v tu chvíli Slunce na obloze bylo. Fotky
+   částečných fází nemusí mít stejný záběr jako pozadí. Černé snímky bez Slunce se samy vypnou.
+4. **Jas a vzhled** — jas povrchu Slunce se u každé fotky **automaticky vyrovná** na
+   společnou hodnotu (posuvník **Jas povrchu**). U vybraného snímku ho doladíte posuvníkem
+   **Korekce jasu** (EV). Dál lze volit barvu (původní / sjednocená / neutrální / zlatavá),
+   prolnutí (Měsíc průhledný nebo černý), velikost Sluncí a zda zapadající Slunce schovat
+   za obzor.
+5. **Kontrola a doladění** — přes fotku se kreslí **denní dráha Slunce** s časovými
+   značkami, volitelně i **ekliptika**, vyznačený a vypočtený horizont a značky snímků.
+   Každé Slunce jde **přetáhnout myší** nebo posunout šipkami (Shift = 5 px, Ctrl = 0,2 px);
+   **`↺ Vrátit na vypočtenou polohu`** ruční posun zruší.
+6. **`💾 Exportovat kompozit`** vykreslí výsledek v plném rozlišení (TIFF 16 bit, PNG, JPEG).
+
+Celé nastavení kompozitu se ukládá do projektu `.ahdrproj` spolu s HDR skládáním.
+
+> **Přesnost:** poloha se počítá z efemeridy Slunce (algoritmus Meeus/NOAA, chyba ~0,01°)
+> včetně atmosférické refrakce a ukotvuje se na Slunce v pozadí. Když mají pozadí i srpky
+> čas ze **stejného fotoaparátu**, chyba jeho hodin se téměř vyruší. Pokud pozadí fotil jiný
+> přístroj, nastavte **Korekci hodin**. Slunce se za 2 minuty posune o svůj průměr, proto
+> záleží na sekundách.
+
 ### Klávesové zkratky
 
 | Zkratka | Akce |
@@ -133,6 +172,7 @@ Náhled je záměrně zmenšený kvůli rychlosti — na kvalitu exportu to nem�
 | `Ctrl+R` | Složit snímky |
 | `Ctrl+E` | Exportovat v plné kvalitě |
 | `Ctrl+M` | Ruční dozarovnání |
+| `Ctrl+T` | Časosběrný kompozit zatmění |
 | `Ctrl+0` / `Ctrl+1` | Přizpůsobit oknu / zobrazit 1:1 |
 | `Ctrl+Q` | Konec |
 | Kolečko myši | Zoom · dvojklik = přizpůsobit |
@@ -150,6 +190,9 @@ Náhled je záměrně zmenšený kvůli rychlosti — na kvalitu exportu to nem�
 | Projekt nenajde fotky | Fotky byly přesunuty. Přesouvejte vždy celou složku i s projektem — pak fungují relativní cesty. |
 | Export se nepodaří zapsat | Zkontrolujte, že soubor není otevřený v jiném programu a že do složky lze zapisovat. |
 | Chyba při instalaci PyQt6 | Použijte Python 3.12 místo 3.13+. |
+| Kompozit hlásí „Slunce je pod horizontem“ | Zkontrolujte čas pozadí, časové pásmo (letní čas = UTC+2) a polohu. |
+| Průměr Slunce a horizont si odporují | Zkontrolujte výšku horizontu (z kopce je obzor níž) a čas; v nouzi zvolte **Měřítko z: Jen průměr Slunce**. |
+| Srpek sedí vedle dráhy | Nejspíš nesedí čas snímku — upravte ho u vybraného snímku, nebo nastavte **Korekci hodin**. |
 | Okno se nevejde na obrazovku | Okna se sama zmenší podle plochy monitoru. Ovládací panely lze rolovat, takže tlačítka dole zůstanou vždy dosažitelná. |
 
 Pokud dojde k neočekávané chybě, aplikace ji zobrazí v dialogu (včetně technického
@@ -176,6 +219,13 @@ výpisu pod tlačítkem *Show Details*) a **běží dál** — rozpracovaná pr�
   multi-scale coronal enhancement that is gated off in the dark sky, so grain is never sharpened.
 - **Export** — 16-bit TIFF, 16-bit PNG, quality JPEG and 32-bit Radiance HDR, with
   Unicode-safe file writing.
+- **Eclipse sequence composite** — drop filtered partial-phase frames into a stacked
+  totality background. The background is calibrated as a pinhole camera from the marked
+  horizon, Sun and solar diameter (weighted least squares), and every Sun is placed from its
+  EXIF timestamp through a built-in solar ephemeris (Meeus, with refraction) — on synthetic
+  data within 0.05 px over a 70-minute sequence. Crescents are fitted on the solar limb only,
+  surface brightness is equalised automatically with a per-frame EV correction, and the
+  Sun's daily path, time ticks and the ecliptic can be overlaid for checking.
 - **Project files** — save the whole session (frames, per-frame alignment, exclusions,
   crop, every setting) to a small JSON `.ahdrproj` and reopen it exactly as it was.
   Paths are stored both absolutely and relative to the project, so moving a folder with
@@ -212,6 +262,10 @@ Covers the numerical core (disc detection, alignment, all three fusion engines, 
 post-processing, every export format including Unicode paths) plus GUI stability scenarios:
 rapid ROI dragging, repeated worker cancellation, missing files, dialog cancel semantics,
 an end-to-end full-resolution export, and closing the window with work in flight.
+The eclipse composite is checked against the Meeus reference examples and against a
+synthetic sky photographed by a known camera: disc detection on fat, thin and red
+crescents, camera recovery, placement accuracy, brightness equalisation, horizon clipping,
+project round-trips and the editor itself.
 
 ## 📋 Requirements
 

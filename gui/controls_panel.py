@@ -92,6 +92,7 @@ class ControlsPanel(QWidget):
     crop_defaults_requested = pyqtSignal()     # enabled with no usable rectangle yet
     manual_align_requested = pyqtSignal()
     export_requested = pyqtSignal()
+    composite_requested = pyqtSignal()
 
     # name -> (brightness, contrast, gamma, saturation, shadows, highlights,
     #          denoise, coronal_boost, coronal_radius)
@@ -149,6 +150,14 @@ class ControlsPanel(QWidget):
         self.btn_export.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_export.clicked.connect(self.export_requested.emit)
         main_layout.addWidget(self.btn_export)
+
+        self.btn_composite = QPushButton("🌗  Časosběr zatmění (kompozit)…  (Ctrl+T)")
+        self.btn_composite.setToolTip(
+            "Složí fotky částečných fází přes filtr do snímku úplného zatmění —\n"
+            "každé Slunce na své skutečné místo na obloze podle času pořízení.")
+        self.btn_composite.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_composite.clicked.connect(self.composite_requested.emit)
+        main_layout.addWidget(self.btn_composite)
 
     def _build_engine_group(self) -> QGroupBox:
         group = QGroupBox("Výpočet a zarovnání expozic")

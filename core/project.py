@@ -95,6 +95,8 @@ class Project:
     preset_name: str = ""
     compare_mode: bool = False
     histogram_visible: bool = False
+    # The partial-phase sequence composite (CompositeSettings.to_dict()), or {}.
+    eclipse_composite: Dict[str, Any] = field(default_factory=dict)
     format_version: int = PROJECT_FORMAT_VERSION
     app_note: str = "Astro HDR Stacker project"
 
@@ -123,6 +125,41 @@ def _as_rect(value: Any) -> Optional[Tuple[int, int, int, int]]:
     except (TypeError, ValueError):
         return None
     return rect if rect[2] > 0 and rect[3] > 0 else None
+
+
+def _composite_paths(composite: Dict[str, Any]):
+    """(owner dict, path key, relpath key) for every file the composite names."""
+    if not isinstance(composite, dict):
+        return
+    if composite.get("background_path"):
+        yield composite, "background_path", "background_relpath"
+    for frame in composite.get("frames") or []:
+        if isinstance(frame, dict) and frame.get("path"):
+            yield frame, "path", "relpath"
+
+
+def _relativize_composite(composite: Dict[str, Any], project_dir: str) -> None:
+    for owner, key, rel_key in _composite_paths(composite):
+        owner[key] = os.path.abspath(owner[key])
+        owner[rel_key] = _safe_relpath(owner[key], project_dir)
+
+
+def _resolve_composite(composite: Dict[str, Any], project_dir: str) -> List[str]:
+    """
+    Points the composite's paths at files that exist, preferring the path
+    relative to the project (a moved folder), and returns those still missing.
+    """
+    missing = []
+    for owner, key, rel_key in _composite_paths(composite):
+        rel = owner.pop(rel_key, "")
+        if rel:
+            candidate = os.path.normpath(os.path.join(project_dir, rel))
+            if os.path.isfile(candidate):
+                owner[key] = candidate
+                continue
+        if not os.path.isfile(owner[key]):
+            missing.append(owner[key])
+    return missing
 
 
 def build_project(
@@ -162,6 +199,7 @@ def save_project(project: Project, filepath: str) -> None:
     project_dir = os.path.dirname(os.path.abspath(filepath))
     for frame in project.frames:
         frame.relpath = _safe_relpath(frame.path, project_dir)
+    _relativize_composite(project.eclipse_composite, project_dir)
 
     temp_path = filepath + ".tmp"
     try:
@@ -198,7 +236,7 @@ def load_project(filepath: str) -> Tuple[Project, List[str]]:
             f"Soubor není platný projekt Astro HDR Stacker (chyba na řádku {e.lineno})."
         ) from e
 
-    if not isinstance(data, dict) or "frames" not in data:
+    if not isinstance(data, dict) or ("frames" not in data and "eclipse_composite" not in data):
         raise ProjectError("Soubor není projekt Astro HDR Stacker.")
 
     version = int(data.get("format_version", 1) or 1)
@@ -229,6 +267,10 @@ def load_project(filepath: str) -> Tuple[Project, List[str]]:
     if "crop_rect" in settings:
         settings["crop_rect"] = _as_rect(settings["crop_rect"])
 
+    composite = data.get("eclipse_composite")
+    composite = dict(composite) if isinstance(composite, dict) else {}
+    missing.extend(_resolve_composite(composite, project_dir))
+
     project = Project(
         frames=frames,
         settings=settings,
@@ -240,6 +282,7 @@ def load_project(filepath: str) -> Tuple[Project, List[str]]:
         preset_name=str(data.get("preset_name", "") or ""),
         compare_mode=bool(data.get("compare_mode", False)),
         histogram_visible=bool(data.get("histogram_visible", False)),
+        eclipse_composite=composite,
         format_version=version,
     )
     return project, missing

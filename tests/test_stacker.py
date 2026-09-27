@@ -11,6 +11,7 @@ Run with:  python tests/test_stacker.py
 import os
 import sys
 import json
+import math
 import shutil
 import tempfile
 import time
@@ -40,6 +41,17 @@ from core.postprocess import (
 from core.image_cache import ImageCache, available_memory_bytes
 from core.project import (build_project, save_project, load_project, resolved_paths,
                           apply_frame_records, ProjectError, PROJECT_FORMAT_VERSION)
+from core.solar_position import (sun_position, sun_angular_radius_deg, julian_day,
+                                 greenwich_sidereal_time_deg, refraction_deg,
+                                 ecliptic_horizontal)
+from core.exif_and_analysis import extract_capture_time, extract_gps_position
+from core.eclipse_composite import (
+    SkyCamera, Calibration, CompositeSettings, CompositeError, PartialFrame, solve_camera,
+    calibrate, compute_placements, detect_sun_disc, detect_totality_disc, cut_out_sun,
+    load_image_float, render_composite, frame_gains, path_polyline, format_time,
+)
+from core.solar_position import _solar_coordinates
+from datetime import datetime, timedelta
 
 _FAILURES = []
 _PASSES = 0
@@ -601,6 +613,436 @@ def test_projects(tmpdir, paths):
     print(f"   project round-trip verified, {os.path.getsize(project_path)} B on disk")
 
 
+# ------------------------------------------------- Eclipse sequence composite
+
+COMPOSITE_SITE = (42.5987, -5.5671, 2.0)          # León, CEST
+COMPOSITE_TOTALITY = datetime(2026, 8, 12, 20, 28, 0)
+
+
+def _write_exif_jpeg(path: str, bgr_u8: np.ndarray, moment: datetime,
+                     gps=None, offset: str = "+02:00"):
+    """Saves a JPEG carrying DateTimeOriginal (+ sub-seconds, offset) and GPS."""
+    from PIL import Image, ExifTags
+    img = Image.fromarray(cv2.cvtColor(bgr_u8, cv2.COLOR_BGR2RGB))
+    exif = img.getexif()
+    sub = exif.get_ifd(ExifTags.IFD.Exif)
+    sub[0x9003] = moment.strftime("%Y:%m:%d %H:%M:%S")
+    sub[0x9291] = f"{moment.microsecond // 10000:02d}"
+    sub[0x9011] = offset
+    if gps is not None:
+        lat, lon = gps
+        g = exif.get_ifd(ExifTags.IFD.GPSInfo)
+        g[1] = "N" if lat >= 0 else "S"
+        g[2] = (float(int(abs(lat))), float(int(abs(lat) * 60) % 60), (abs(lat) * 3600) % 60)
+        g[3] = "E" if lon >= 0 else "W"
+        g[4] = (float(int(abs(lon))), float(int(abs(lon) * 60) % 60), (abs(lon) * 3600) % 60)
+    img.save(path, quality=97, exif=exif)
+
+
+def _crescent_frame(size=(900, 640), centre=(430.3, 310.6), radius=31.0,
+                    moon_offset=(22.0, -9.0), level=0.9, tint=(1.0, 1.0, 1.0)) -> np.ndarray:
+    """A filtered partial-phase frame: a limb-darkened disc minus the Moon."""
+    w, h = size
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    d = np.hypot(xx - centre[0], yy - centre[1])
+    mu = np.sqrt(np.clip(1.0 - (d / radius) ** 2, 0.0, 1.0))
+    disc = np.clip(radius + 0.5 - d, 0.0, 1.0) * (0.6 + 0.4 * mu)
+    moon = np.clip(np.hypot(xx - centre[0] - moon_offset[0],
+                            yy - centre[1] - moon_offset[1]) - radius * 1.03 + 0.5, 0.0, 1.0)
+    value = disc * moon * level
+    bgr = np.dstack([value * tint[0], value * tint[1], value * tint[2]])
+    return np.clip(bgr * 255.0 + 1.5, 0, 255).astype(np.uint8)
+
+
+def _composite_scene(tmpdir: str):
+    """
+    A synthetic totality background photographed by a known camera, plus
+    filtered partial-phase frames with EXIF times — everything the composite
+    needs, with ground truth to check against.
+    """
+    lat, lon, off = COMPOSITE_SITE
+    az0, alt0 = sun_position(COMPOSITE_TOTALITY, lat, lon, off)
+    rs = sun_angular_radius_deg(COMPOSITE_TOTALITY, off)
+    cam = SkyCamera(1600, 1000, 2200.0, az0 + 4.0, alt0 + 3.0, 0.8)
+
+    w, h = cam.width, cam.height
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    h1 = cam.project(az0 - 15.0, 0.0)
+    h2 = cam.project(az0 + 15.0, 0.0)
+    # Ground below the true horizon line, a blue twilight sky above it.
+    side = (h2[0] - h1[0]) * (yy - h1[1]) - (h2[1] - h1[1]) * (xx - h1[0])
+    sky = side < 0
+    bg = np.zeros((h, w, 3), np.float32)
+    bg[..., 0] = np.where(sky, 0.30 - 0.12 * yy / h, 0.03)
+    bg[..., 1] = np.where(sky, 0.16 - 0.06 * yy / h, 0.03)
+    bg[..., 2] = np.where(sky, 0.08, 0.03)
+    sx, sy = cam.project(az0, alt0)
+    r_moon = cam.focal * math.tan(math.radians(rs)) * 1.03
+    d = np.hypot(xx - sx, yy - sy)
+    corona = np.where(d <= r_moon, 0.0, 1.0 / np.maximum(d - r_moon + 1.0, 1.0) ** 0.9)
+    bg = np.clip(bg * (d > r_moon)[..., None] + corona[..., None] * np.array([0.9, 0.95, 1.0]),
+                 0.0, 1.0)
+    bg_path = os.path.join(tmpdir, "totalita_stack.tif")
+    save_image(bg_path, bg)
+
+    frames = []
+    for minutes, level, moon_dx in ((-40, 0.45, 12.0), (-12, 0.95, 40.0), (30, 0.7, -30.0)):
+        moment = COMPOSITE_TOTALITY + timedelta(minutes=minutes, seconds=0.25)
+        path = os.path.join(tmpdir, f"castecna_{minutes:+d}.jpg")
+        _write_exif_jpeg(path, _crescent_frame(level=level, moon_offset=(moon_dx, -6.0)),
+                         moment, gps=(lat, lon))
+        frames.append((path, moment, level))
+    return dict(camera=cam, bg_path=bg_path, horizon=(h1[0], h1[1], h2[0], h2[1]),
+                sun=(sx, sy), sun_radius_deg=rs, moon_radius=r_moon, frames=frames)
+
+
+def test_solar_position():
+    section("8a. Solar ephemeris")
+    # Meeus, Astronomical Algorithms, example 25.a (1992 Oct 13.0).
+    ra, dec, dist, _eps = _solar_coordinates(julian_day(datetime(1992, 10, 13)))
+    check(abs(ra - 198.38083) < 0.001 and abs(dec + 7.78507) < 0.001,
+          f"Sun RA/Dec must match Meeus 25.a ({ra:.5f}, {dec:.5f})")
+    check(abs(dist - 0.99766) < 0.0001, f"Sun distance must match Meeus ({dist:.5f})")
+    # Meeus example 12.a: GMST on 1987 April 10, 0h UT.
+    gmst = greenwich_sidereal_time_deg(julian_day(datetime(1987, 4, 10)))
+    check(abs(gmst - 197.693195) < 1e-4, f"sidereal time must match Meeus 12.a ({gmst:.6f})")
+
+    # At local solar noon the true altitude is 90 - |lat - dec|, due south.
+    moment = datetime(2026, 6, 21, 12, 0)
+    (az, alt), _m = max(((sun_position(moment + timedelta(minutes=m), 50.0, 0.0, 0.0,
+                                       refraction=False), m) for m in range(-30, 31)),
+                        key=lambda t: t[0][1])
+    check(abs(alt - (90.0 - 50.0 + 23.43)) < 0.05, f"noon altitude at the solstice ({alt:.3f})")
+    check(abs(az - 180.0) < 1.5, f"noon azimuth must be south ({az:.2f})")
+
+    r0 = refraction_deg(0.0)
+    check(0.45 < r0 < 0.65 and refraction_deg(45.0) < 0.02,
+          f"refraction must be ~0.5 deg at the horizon, tiny high up ({r0:.3f})")
+    rs = sun_angular_radius_deg(datetime(2026, 8, 12))
+    check(0.260 < rs < 0.266, f"August solar radius ({rs:.4f})")
+    # The Sun lies on the ecliptic: the closest ecliptic sample is within a step.
+    lat, lon, off = COMPOSITE_SITE
+    az_s, alt_s = sun_position(COMPOSITE_TOTALITY, lat, lon, off)
+    nearest = min(math.hypot((a - az_s) * math.cos(math.radians(alt_s)), h - alt_s)
+                  for _l, a, h in ecliptic_horizontal(COMPOSITE_TOTALITY, lat, lon, off, 0.25))
+    check(nearest < 0.25, f"the Sun must lie on the ecliptic ({nearest:.3f} deg)")
+    print(f"   Meeus examples reproduced; León totality Sun at az {az_s:.2f}, alt {alt_s:.2f}")
+
+
+def test_eclipse_composite(tmpdir):
+    section("8b. Eclipse sequence composite — calibration, placement, brightness")
+    scene = _composite_scene(tmpdir)
+    cam_true = scene["camera"]
+    lat, lon, off = COMPOSITE_SITE
+
+    # EXIF: capture time with sub-seconds and offset, and GPS.
+    path0, moment0, _lvl = scene["frames"][0]
+    moment, offset = extract_capture_time(path0)
+    check(moment == moment0 and offset == 2.0,
+          f"EXIF capture time must round-trip ({moment}, {offset})")
+    gps = extract_gps_position(path0)
+    check(gps is not None and abs(gps[0] - lat) < 1e-4 and abs(gps[1] - lon) < 1e-4,
+          f"EXIF GPS must round-trip ({gps})")
+
+    # Sun detection in a filtered frame, including a thin crescent and a red Sun.
+    for moon_dx, tint, label in ((12.0, (1, 1, 1), "fat"), (46.0, (1, 1, 1), "thin"),
+                                 (-20.0, (0.02, 0.3, 1.0), "red")):
+        frame = _crescent_frame(moon_offset=(moon_dx, -4.0), tint=tint)
+        disc = detect_sun_disc(frame)
+        ok = disc is not None and math.hypot(disc[0] - 430.3, disc[1] - 310.6) < 1.0 \
+            and abs(disc[2] - 31.0) < 1.0
+        check(ok, f"{label} crescent: solar disc must be recovered ({disc})")
+    check(detect_sun_disc(np.full((300, 400, 3), 2, np.uint8)) is None,
+          "a black frame has no Sun")
+
+    bg = load_image_float(scene["bg_path"])
+    check(bg is not None and bg.dtype == np.float32 and bg.shape == (1000, 1600, 3),
+          "a 16-bit TIFF background must load as float")
+    disc = detect_totality_disc(bg)
+    sx, sy = scene["sun"]
+    check(disc is not None and math.hypot(disc[0] - sx, disc[1] - sy) < 0.7,
+          f"the lunar disc must be found in the corona ({disc} vs {sx:.1f},{sy:.1f})")
+    check(disc is not None and abs(disc[2] - scene["moon_radius"]) < 1.0,
+          f"the lunar radius must be measured ({disc[2] if disc else None} vs "
+          f"{scene['moon_radius']:.2f})")
+
+    # Camera solve: exact inputs give the exact camera back.
+    az0, alt0 = sun_position(COMPOSITE_TOTALITY, lat, lon, off)
+    rs = scene["sun_radius_deg"]
+    exact = Calibration(1600, 1000, sx, sy, 2 * cam_true.focal * math.tan(math.radians(rs)),
+                        scene["horizon"], 0.0)
+    for mode in ("auto", "diameter", "horizon"):
+        cam = solve_camera(exact, az0, alt0, rs, mode).camera
+        check(abs(cam.focal - cam_true.focal) < 0.5 and abs(cam.roll - cam_true.roll) < 0.01
+              and abs(((cam.yaw - cam_true.yaw + 180) % 360) - 180) < 0.01
+              and abs(cam.pitch - cam_true.pitch) < 0.01,
+              f"camera solve ({mode}) must recover the true camera ({cam})")
+    try:
+        solve_camera(Calibration(1600, 1000, sx, sy), az0, alt0, rs, "auto")
+        check(False, "no scale information must be refused")
+    except CompositeError:
+        check(True, "")
+
+    # Full pipeline with the DETECTED Moon: the Moon is ~3 % bigger than the
+    # Sun, so the automatic mode must lean on the horizon for the scale.
+    settings = CompositeSettings(
+        background_path=scene["bg_path"], background_time=format_time(COMPOSITE_TOTALITY),
+        utc_offset_hours=off, latitude=lat, longitude=lon, location_set=True,
+        sun_x=disc[0], sun_y=disc[1], sun_diameter=2 * disc[2], horizon=scene["horizon"])
+    cutouts = []
+    for path, moment, _level in scene["frames"]:
+        img = load_image_float(path)
+        fdisc = detect_sun_disc(img)
+        settings.frames.append(PartialFrame(path=path, filename=os.path.basename(path),
+                                            time=format_time(extract_capture_time(path)[0]),
+                                            disc=fdisc))
+        cutouts.append(cut_out_sun(img, fdisc))
+    report = calibrate(settings, 1600, 1000)
+    placements = compute_placements(settings, report.camera)
+    worst = 0.0
+    for place, (_p, moment, _l) in zip(placements, scene["frames"]):
+        a, e = sun_position(moment, lat, lon, off)
+        tx, ty = cam_true.project(a, e)
+        worst = max(worst, math.hypot(place.x - tx, place.y - ty))
+    true_r = cam_true.focal * math.tan(math.radians(rs))
+    check(worst < 1.5, f"partial Suns must land on the true path (worst {worst:.2f} px)")
+    check(all(abs(p.radius - true_r) < 0.03 * true_r for p in placements),
+          "each Sun must be drawn at the true solar size")
+    print(f"   placement error {worst:.2f} px over a 70-minute sequence")
+
+    # Rendering: every Sun equalised to the same surface brightness.
+    settings.target_level = 0.8
+    out = render_composite(bg, settings, cutouts, report.camera)
+    check(out.shape == bg.shape and np.isfinite(out).all(), "the composite must be finite")
+    levels = []
+    for place in placements:
+        x, y, r = int(round(place.x)), int(round(place.y)), place.radius
+        patch = out[int(y - r):int(y + r) + 1, int(x - r):int(x + r) + 1].max(axis=2)
+        levels.append(float(np.percentile(patch, 97)))
+    check(max(levels) - min(levels) < 0.08 and all(abs(v - 0.8) < 0.12 for v in levels),
+          f"surface brightness must be equalised to the target ({levels})")
+    gains = frame_gains(settings, cutouts)
+    check(gains[0][0] > gains[1][0] * 1.5,
+          "the dimmest frame must receive the largest automatic gain")
+
+    # A manual EV correction brightens only that Sun.
+    settings.frames[2].ev_adjust = -1.0
+    dimmer = render_composite(bg, settings, cutouts, report.camera)
+    p2 = placements[2]
+    region = (slice(int(p2.y - p2.radius), int(p2.y + p2.radius) + 1),
+              slice(int(p2.x - p2.radius), int(p2.x + p2.radius) + 1))
+    check(float(dimmer[region].max()) < float(out[region].max()) * 0.7,
+          "a -1 EV correction must darken that Sun")
+    settings.frames[2].ev_adjust = 0.0
+
+    # A Sun below the horizon must not be painted over the landscape.
+    below = CompositeSettings.from_dict(settings.to_dict())
+    below.frames[2].time = format_time(COMPOSITE_TOTALITY + timedelta(minutes=75))
+    place_below = compute_placements(below, report.camera)[2]
+    a, e = sun_position(COMPOSITE_TOTALITY + timedelta(minutes=75), lat, lon, off)
+    check(e < -0.5, f"the test Sun must really be below the horizon ({e:.2f})")
+    clipped = render_composite(bg, below, cutouts, report.camera)
+    if place_below is not None and 0 <= place_below.x < 1600 and 0 <= place_below.y < 1000:
+        x, y = int(place_below.x), int(place_below.y)
+        check(np.allclose(clipped[y - 3:y + 4, x - 3:x + 4], bg[y - 3:y + 4, x - 3:x + 4],
+                          atol=1e-3),
+              "a Sun below the horizon must be hidden by the landscape")
+    below.clip_below_horizon = False
+    unclipped = render_composite(bg, below, cutouts, report.camera)
+    if place_below is not None and 0 <= place_below.x < 1600 and 0 <= place_below.y < 1000:
+        check(float(unclipped[y - 3:y + 4, x - 3:x + 4].max()) > 0.5,
+              "with clipping off the Sun must be painted")
+
+    # The path overlay passes through the totality Sun.
+    path = path_polyline(settings, report.camera, 1.0)
+    near = min(math.hypot(px - sx, py - sy) for t, px, py in path if np.isfinite(px))
+    check(near < 8.0, f"the drawn path must pass the totality Sun ({near:.2f} px)")
+
+    # Proxy rendering is the same picture at a smaller size.
+    proxy = cv2.resize(bg, (800, 500), interpolation=cv2.INTER_AREA)
+    small = render_composite(proxy, settings, cutouts, report.camera, scale=0.5)
+    p0 = placements[0]
+    # Sample the whole disc: its centre may well be covered by the Moon.
+    r_half = int(math.ceil(p0.radius * 0.5))
+    x_half, y_half = int(round(p0.x * 0.5)), int(round(p0.y * 0.5))
+    small_patch = small[y_half - r_half:y_half + r_half + 1, x_half - r_half:x_half + r_half + 1]
+    check(float(small_patch.max()) > 0.6,
+          "the proxy preview must show the Sun at the scaled position")
+
+    # Settings survive a dict round-trip, including tuples.
+    again = CompositeSettings.from_dict(json.loads(json.dumps(settings.to_dict())))
+    check(again.horizon == tuple(settings.horizon) and len(again.frames) == 3
+          and again.frames[0].disc == tuple(settings.frames[0].disc),
+          "composite settings must round-trip through JSON")
+    check(CompositeSettings.from_dict({"blend_mode": "bogus", "frames": [{"path": "x",
+                                                                          "future": 1}]}
+                                      ).blend_mode == "lighten",
+          "unknown values and keys must be tolerated")
+
+    # Saved inside a project, the composite follows the folder when it moves.
+    bundle = os.path.join(tmpdir, "kompozit")
+    os.makedirs(bundle, exist_ok=True)
+    moved_settings = CompositeSettings.from_dict(settings.to_dict())
+    moved_settings.background_path = shutil.copy2(scene["bg_path"], bundle)
+    for frame in moved_settings.frames:
+        frame.path = shutil.copy2(frame.path, bundle)
+    project_path = os.path.join(bundle, "časosběr.ahdrproj")
+    save_project(build_project([], {}, project_path=project_path,
+                               eclipse_composite=moved_settings.to_dict()), project_path)
+    moved_root = os.path.join(tmpdir, "kompozit_přesunut")
+    shutil.copytree(bundle, moved_root)
+    shutil.rmtree(bundle)
+    loaded, missing = load_project(os.path.join(moved_root, "časosběr.ahdrproj"))
+    restored = CompositeSettings.from_dict(loaded.eclipse_composite)
+    check(not missing and restored.background_path.startswith(moved_root)
+          and all(f.path.startswith(moved_root) for f in restored.frames),
+          f"a moved composite project must find its photos ({missing})")
+    check(restored.horizon == tuple(settings.horizon) and restored.sun_diameter == settings.sun_diameter,
+          "the composite calibration must survive the project file")
+    return scene
+
+
+def test_composite_gui(tmpdir, scene):
+    section("8c. Eclipse composite editor — GUI")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QCoreApplication, QEventLoop
+    # Kept referenced: a collected QApplication aborts every later widget.
+    app = QApplication.instance() or QApplication([])
+    check(app is not None, "a QApplication must exist")
+    import gui.eclipse_composite_window as ecw
+    from gui.main_window import MainWindow
+
+    class _SilentBox:
+        """Modal message boxes would block an unattended test."""
+        StandardButton = ecw.QMessageBox.StandardButton
+        messages = []
+
+        @classmethod
+        def information(cls, *args, **kwargs):
+            cls.messages.append(args[1:])
+
+        warning = information
+
+        @classmethod
+        def question(cls, *args, **kwargs):
+            return ecw.QMessageBox.StandardButton.Yes
+
+    original_box = ecw.QMessageBox
+    ecw.QMessageBox = _SilentBox
+
+    def pump(timeout_ms: int, until=None) -> bool:
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+            if until is not None and until():
+                return True
+            time.sleep(0.01)
+        return until() if until is not None else True
+
+    try:
+        window = MainWindow(session_persistence=False)
+        window.show()
+        window.open_eclipse_composite()
+        editor = window._composite_window
+        check(editor is not None and editor.isVisible(), "the composite editor must open")
+
+        editor.set_background(scene["bg_path"])
+        pump(10000, lambda: editor._bg_proxy is not None and not editor.busy())
+        s = editor.settings
+        check(editor._bg_size == (1600, 1000), f"background size ({editor._bg_size})")
+        check(s.sun_diameter > 0 and math.hypot(s.sun_x - scene["sun"][0],
+                                                s.sun_y - scene["sun"][1]) < 1.0,
+              "loading the background must find the lunar disc")
+
+        # The stack has no EXIF: take the time and place from an original frame.
+        editor.bg_time.set_value(COMPOSITE_TOTALITY)
+        editor._on_bg_time_changed()
+        editor.spin_utc.setValue(2.0)
+        editor.combo_place.setCurrentIndex(1)            # León preset
+        editor._on_horizon_drawn(*scene["horizon"])
+
+        editor.add_partials([p for p, _m, _l in scene["frames"]])
+        pump(15000, lambda: not editor.busy() and len(s.frames) == 3)
+        check(len(s.frames) == 3 and all(f.time_from_exif for f in s.frames),
+              "partial frames must be added with their EXIF times")
+        check(all(editor._cutouts.get(f.path) is not None for f in s.frames),
+              "every partial frame must yield a Sun cut-out")
+        check([f.moment for f in s.frames] == sorted(f.moment for f in s.frames),
+              "frames must be ordered by time")
+
+        pump(500, lambda: all(p is not None for p in editor._placements) and editor._placements)
+        check(editor._report is not None, f"the editor must calibrate ({editor._calib_error})")
+        check(len(editor._placements) == 3 and all(p is not None for p in editor._placements),
+              "every frame must be placed")
+        check(editor.canvas._base_pixmap is not None, "the preview must be rendered")
+        overlay = editor.canvas._overlay
+        check(bool(overlay.get("path")) and bool(overlay.get("ticks"))
+              and len(overlay.get("markers", [])) == 3,
+              "the path, its time ticks and the frame markers must be drawn")
+
+        # Drag a Sun on the canvas, then nudge it with the keyboard.
+        place = editor._placements[1]
+        # Two moves before the debounced preview re-renders — a fast drag.
+        editor._on_frame_dragged(1, place.x + 4.0, place.y - 2.0)
+        editor._on_frame_dragged(1, place.x + 12.0, place.y - 5.0)
+        check(abs(s.frames[1].offset_x - 12.0) < 0.05 and abs(s.frames[1].offset_y + 5.0) < 0.05,
+              f"dragging a Sun must store the offset from its computed place "
+              f"({s.frames[1].offset_x}, {s.frames[1].offset_y})")
+        editor._select_frame(1)
+        editor.nudge_selected(0.2, 0.0)
+        check(abs(s.frames[1].offset_x - 12.2) < 0.01, "arrow nudges must add to the offset")
+        editor._reset_frame_manual()
+        check(s.frames[1].offset_x == 0.0 and s.frames[1].offset_y == 0.0,
+              "the reset must return the Sun to its computed place")
+
+        # Per-frame EV and the global look controls feed the settings.
+        editor.slider_ev.setValue(0.5)
+        check(abs(s.frames[1].ev_adjust - 0.5) < 1e-6, "the EV slider must edit the selected frame")
+        editor.combo_blend.setCurrentIndex(editor.combo_blend.findData("normal"))
+        check(s.blend_mode == "normal", "the blend mode must be applied")
+        editor.chk_ecliptic.setChecked(True)
+        pump(300)
+        check(bool(editor.canvas._overlay.get("ecliptic")), "the ecliptic overlay must be drawn")
+
+        # Full-resolution export.
+        out_path = os.path.join(tmpdir, "časosběr_kompozit.tif")
+        task = editor.start_export(out_path)
+        check(task is not None, "the export must start")
+        pump(30000, lambda: not editor.busy())
+        written = imread_unicode(out_path, cv2.IMREAD_UNCHANGED)
+        check(written is not None and written.dtype == np.uint16 and written.shape[:2] == (1000, 1600),
+              "the composite must be exported as a full-size 16-bit TIFF")
+
+        # The composite is part of the project and comes back on reopening.
+        project_path = os.path.join(tmpdir, "kompozit_gui.ahdrproj")
+        check(window._write_project(project_path), "a composite-only project must save")
+        window.new_project()
+        check(not window._composite_settings.frames, "a new project must clear the composite")
+        check(window._load_project_file(project_path, remember_path=True),
+              "a composite-only project must open")
+        check(len(window._composite_settings.frames) == 3
+              and window._composite_settings.horizon is not None
+              and abs(window._composite_settings.frames[1].ev_adjust - 0.5) < 1e-6,
+              "the composite must be restored from the project")
+
+        window.open_eclipse_composite()
+        reopened = window._composite_window
+        pump(15000, lambda: reopened._bg_proxy is not None and not reopened.busy()
+             and len(reopened._cutouts) == 3)
+        check(reopened._bg_proxy is not None and len(reopened._cutouts) == 3,
+              "a reopened project must reload its background and cut-outs")
+
+        # Closing with a load in flight must not leave a thread running.
+        reopened._cutouts.clear()
+        reopened._reload_inputs()
+        window.close()
+        check(not any(t.isRunning() for t in reopened._tasks), "closing must stop every task")
+        print(f"   editor calibrated, placed 3 Suns, exported {written.shape if written is not None else None}")
+    finally:
+        ecw.QMessageBox = original_box
+
+
 # ----------------------------------------------------------------- GUI tests
 
 def test_gui(paths):
@@ -1001,12 +1443,20 @@ def run_all_tests() -> int:
         test_export(tmpdir, enhanced, hdr)
         test_image_cache(paths)
         test_projects(tmpdir, paths)
+        test_solar_position()
+        scene = test_eclipse_composite(tmpdir)
 
         try:
             test_gui(paths)
         except Exception:
             traceback.print_exc()
             _FAILURES.append("GUI test suite raised an exception")
+
+        try:
+            test_composite_gui(tmpdir, scene)
+        except Exception:
+            traceback.print_exc()
+            _FAILURES.append("composite GUI test raised an exception")
 
     print("\n" + "=" * 64)
     if _FAILURES:

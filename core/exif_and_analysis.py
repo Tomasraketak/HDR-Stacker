@@ -8,6 +8,7 @@ preserves per-frame user state (manual shifts, include/exclude) across re-scans.
 import os
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import List, Optional, Tuple, Dict
 import cv2
 import numpy as np
@@ -157,6 +158,108 @@ def extract_exif_metadata(filepath: str) -> dict:
         print(f"EXIF parsing error for {filepath}: {e}")
 
     return info
+
+
+def _exif_tags(filepath: str) -> Dict[str, object]:
+    """Every EXIF tag (base IFD plus the Exif sub-IFD) keyed by its name."""
+    tags: Dict[str, object] = {}
+    with Image.open(filepath) as pil_img:
+        exif = pil_img.getexif()
+        if not exif:
+            return tags
+        for tag_id, value in exif.items():
+            tags[ExifTags.TAGS.get(tag_id, tag_id)] = value
+        try:
+            for k, v in exif.get_ifd(ExifTags.IFD.Exif).items():
+                tags[ExifTags.TAGS.get(k, k)] = v
+        except Exception:
+            pass
+        try:
+            gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
+            if gps:
+                tags['GPSInfo'] = {ExifTags.GPSTAGS.get(k, k): v for k, v in gps.items()}
+        except Exception:
+            pass
+    return tags
+
+
+def _parse_utc_offset(text) -> Optional[float]:
+    """'+02:00' -> 2.0, '-05:30' -> -5.5; anything unparsable -> None."""
+    if not isinstance(text, str):
+        return None
+    text = text.strip().rstrip('\x00')
+    if len(text) < 3 or text[0] not in '+-':
+        return None
+    try:
+        hours, _, minutes = text[1:].partition(':')
+        value = int(hours) + (int(minutes) / 60.0 if minutes else 0.0)
+    except ValueError:
+        return None
+    return -value if text[0] == '-' else value
+
+
+def extract_capture_time(filepath: str) -> Tuple[Optional[datetime], Optional[float]]:
+    """
+    When the photograph was taken: (local camera time, UTC offset in hours).
+
+    DateTimeOriginal is preferred over the file-level DateTime, which editors
+    rewrite on save. Sub-second precision is kept when the camera records it —
+    the Sun moves its own diameter in about two minutes, so seconds matter.
+    Either value is None when the file does not carry it.
+    """
+    try:
+        tags = _exif_tags(filepath)
+    except Exception:
+        return None, None
+
+    for time_key, subsec_key, offset_key in (
+        ('DateTimeOriginal', 'SubsecTimeOriginal', 'OffsetTimeOriginal'),
+        ('DateTimeDigitized', 'SubsecTimeDigitized', 'OffsetTimeDigitized'),
+        ('DateTime', 'SubsecTime', 'OffsetTime'),
+    ):
+        raw = tags.get(time_key)
+        if not isinstance(raw, str):
+            continue
+        try:
+            moment = datetime.strptime(raw.strip().rstrip('\x00')[:19], "%Y:%m:%d %H:%M:%S")
+        except ValueError:
+            continue
+        subsec = tags.get(subsec_key)
+        if isinstance(subsec, str) and subsec.strip().rstrip('\x00').isdigit():
+            digits = subsec.strip().rstrip('\x00')
+            moment = moment.replace(microsecond=int(round(float("0." + digits) * 1e6)) % 1000000)
+        return moment, _parse_utc_offset(tags.get(offset_key))
+    return None, None
+
+
+def extract_gps_position(filepath: str) -> Optional[Tuple[float, float]]:
+    """(latitude, longitude) in signed decimal degrees, or None without GPS."""
+    try:
+        gps = _exif_tags(filepath).get('GPSInfo')
+    except Exception:
+        return None
+    if not isinstance(gps, dict):
+        return None
+
+    def dms(value) -> Optional[float]:
+        if not isinstance(value, (tuple, list)) or not value:
+            return None
+        parts = [_ratio_to_float(v) for v in value]
+        if any(p is None for p in parts):
+            return None
+        parts = (parts + [0.0, 0.0])[:3]
+        return parts[0] + parts[1] / 60.0 + parts[2] / 3600.0
+
+    lat, lon = dms(gps.get('GPSLatitude')), dms(gps.get('GPSLongitude'))
+    if lat is None or lon is None:
+        return None
+    if str(gps.get('GPSLatitudeRef', 'N')).upper().startswith('S'):
+        lat = -lat
+    if str(gps.get('GPSLongitudeRef', 'E')).upper().startswith('W'):
+        lon = -lon
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0) or (lat == 0.0 and lon == 0.0):
+        return None
+    return lat, lon
 
 
 def inspect_exposure_files(
