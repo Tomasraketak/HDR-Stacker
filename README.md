@@ -177,9 +177,16 @@ nebo **`Nástroje → Časosběrný kompozit zatmění`** (`Ctrl+T`).
    (px na stupeň), náklon i směr — a ukáže, jak dobře průměr Slunce a horizont souhlasí.
    Pokud jste fotili z kopce, nastavte **Výšku horizontu** do minusu (100 m ≈ −0,3°).
 3. **Částečné fáze** — **`+ Přidat snímky s filtrem`**. U každé fotky se najde sluneční
-   disk (i z tenkého srpku — kružnice se proloží vnějším okrajem Slunce), vyřízne se a podle
-   **času z EXIF** se umístí přesně tam, kde v tu chvíli Slunce na obloze bylo. Fotky
-   částečných fází nemusí mít stejný záběr jako pozadí. Černé snímky bez Slunce se samy vypnou.
+   disk, vyřízne se a podle **času z EXIF** se umístí přesně tam, kde v tu chvíli Slunce
+   na obloze bylo. Fotky částečných fází nemusí mít stejný záběr jako pozadí. Černé snímky
+   bez Slunce se samy vypnou.
+   - Najde se i **malé Slunce na širokém záběru a tenký srpek** těsně před úplnou fází
+     nebo po ní (poloměr ~10 px, tloušťka 1–2 px). Kružnice se proloží vnějším okrajem Slunce.
+   - Snímky ze **stejného objektivu a zoomu** dostanou **společný poloměr Slunce**, změřený
+     na snímcích, kde je vidět aspoň půlka okraje. U tenkého srpku se pak dopočítá jen
+     střed. Díky tomu mají všechna Slunce v kompozitu stejnou velikost. Snímky s jiným
+     zoomem (podle ohniska v EXIF nebo podle velikosti Slunce) se nemíchají.
+   - U přeexponovaného Slunce se do okraje nezapočítává záře kolem něj.
 4. **Vzhled** — jas povrchu Slunce se u každé fotky **automaticky vyrovná** na společnou
    hodnotu. Dál lze volit barvu (původní / sjednocená / neutrální / zlatavá), prolnutí
    (Měsíc průhledný nebo černý), velikost Sluncí a zda zapadající Slunce schovat za obzor.
@@ -270,8 +277,9 @@ výpisu pod tlačítkem *Show Details*) a **běží dál** — rozpracovaná pr�
   totality background. The background is calibrated as a pinhole camera from the marked
   horizon, Sun and solar diameter (weighted least squares), and every Sun is placed from its
   EXIF timestamp through a built-in solar ephemeris (Meeus, with refraction) — on synthetic
-  data within 0.05 px over a 70-minute sequence. Crescents are fitted on the solar limb only,
-  surface brightness is equalised automatically, and exposure, contrast, mid-tones,
+  data within 0.05 px over a 70-minute sequence. Crescents are fitted on the solar limb only
+  (sub-pixel tracing for Suns ~10 px in radius; thin crescents take the sequence's common
+  solar radius, clustered per lens/zoom), surface brightness is equalised automatically, and exposure, contrast, mid-tones,
   saturation, temperature and tint can be graded for all Suns at once, per frame on top of
   that, and for the background. The tone curves pin black, so the Moon never turns grey.
   The Sun's daily path, time ticks and the ecliptic can be overlaid for checking.
@@ -313,7 +321,8 @@ rapid ROI dragging, repeated worker cancellation, missing files, dialog cancel s
 an end-to-end full-resolution export, and closing the window with work in flight.
 The eclipse composite is checked against the Meeus reference examples and against a
 synthetic sky photographed by a known camera: disc detection on fat, thin and red
-crescents, camera recovery, placement accuracy, brightness equalisation, the master /
+crescents (also tiny ones in a 24 Mpx frame, and overexposed ones with a glow), one solar
+radius across a sequence, camera recovery, placement accuracy, brightness equalisation, the master /
 per-frame / background colour grades, horizon clipping, project round-trips and the editor
 itself.
 

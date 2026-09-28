@@ -232,6 +232,17 @@ def extract_capture_time(filepath: str) -> Tuple[Optional[datetime], Optional[fl
     return None, None
 
 
+def extract_focal_length(filepath: str) -> Optional[float]:
+    """The lens focal length in mm from EXIF, or None when it is not recorded."""
+    try:
+        value = _ratio_to_float(_exif_tags(filepath).get('FocalLength'))
+    except Exception:
+        return None
+    if value is None or not math.isfinite(value) or value <= 0:
+        return None
+    return round(value, 1)
+
+
 def extract_gps_position(filepath: str) -> Optional[Tuple[float, float]]:
     """(latitude, longitude) in signed decimal degrees, or None without GPS."""
     try:

@@ -131,10 +131,51 @@ def _fit_circle(points: np.ndarray) -> Optional[Tuple[float, float, float]]:
     return float(cx), float(cy), float(math.sqrt(r2))
 
 
-def _robust_circle(points: np.ndarray) -> Optional[Tuple[float, float, float]]:
-    """Circle fit that iteratively drops outliers (horn tips, glow, noise)."""
-    circle = _fit_circle(points)
-    for _ in range(4):
+def _geometric_circle(points: np.ndarray, circle: Tuple[float, float, float],
+                      fixed_radius: Optional[float] = None,
+                      iterations: int = 30) -> Optional[Tuple[float, float, float]]:
+    """
+    Refines a circle by minimising the true point-to-circle distances
+    (Gauss-Newton), which the algebraic fit only approximates. With
+    `fixed_radius` only the centre moves.
+    """
+    x = points[:, 0].astype(np.float64)
+    y = points[:, 1].astype(np.float64)
+    cx, cy, r = (float(v) for v in circle)
+    if fixed_radius is not None:
+        r = float(fixed_radius)
+    for _ in range(iterations):
+        dx, dy = x - cx, y - cy
+        dist = np.maximum(np.hypot(dx, dy), 1e-9)
+        columns = [-dx / dist, -dy / dist]
+        if fixed_radius is None:
+            columns.append(-np.ones_like(dist))
+        try:
+            step, *_ = np.linalg.lstsq(np.column_stack(columns), r - dist, rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+        cx, cy = cx + step[0], cy + step[1]
+        if fixed_radius is None:
+            r += step[2]
+        if not (np.isfinite(cx) and np.isfinite(cy) and np.isfinite(r) and r > 0):
+            return None
+        if float(np.abs(step).max()) < 1e-7:
+            break
+    return float(cx), float(cy), float(r)
+
+
+def _robust_fit(points: np.ndarray, init: Optional[Tuple[float, float, float]] = None,
+                fixed_radius: Optional[float] = None
+                ) -> Optional[Tuple[Tuple[float, float, float], np.ndarray]]:
+    """
+    Circle fit that iteratively drops outliers (horn tips, glow, noise).
+    Returns the circle and the points it kept.
+    """
+    circle = init if init is not None else _fit_circle(points)
+    for _ in range(5):
+        if circle is None:
+            return None
+        circle = _geometric_circle(points, circle, fixed_radius)
         if circle is None:
             return None
         cx, cy, r = circle
@@ -144,8 +185,12 @@ def _robust_circle(points: np.ndarray) -> Optional[Tuple[float, float, float]]:
         if keep.sum() < 5 or keep.all():
             break
         points = points[keep]
-        circle = _fit_circle(points)
-    return circle
+    return circle, points
+
+
+def _robust_circle(points: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    fit = _robust_fit(points)
+    return fit[0] if fit is not None else None
 
 
 def _as_float(image: np.ndarray) -> np.ndarray:
@@ -168,9 +213,9 @@ def _brightness(img: np.ndarray) -> np.ndarray:
     return img.max(axis=2) if img.ndim == 3 else img
 
 
-def _limb_circle(mask: np.ndarray) -> Optional[Tuple[float, float, float]]:
+def _limb_points(mask: np.ndarray) -> Optional[np.ndarray]:
     """
-    Fits the solar limb to the largest bright blob in a binary mask.
+    The solar-limb part of the outline of the largest bright blob in a mask.
 
     A crescent's outline is the solar limb (convex) plus the lunar limb
     (concave). Only outline points lying on the blob's convex hull belong to
@@ -189,14 +234,37 @@ def _limb_circle(mask: np.ndarray) -> Optional[Tuple[float, float, float]]:
     pts = contour.reshape(-1, 2).astype(np.float32)
     on_hull = np.array([cv2.pointPolygonTest(hull, (float(px), float(py)), True)
                         for px, py in pts]) < 1.5
-    limb = pts[on_hull] if on_hull.sum() >= 8 else pts
-    circle = _robust_circle(limb)
-    if circle is None:
-        return None
-    cx, cy, r = circle
-    # Contour points sit on the centres of the outermost lit pixels, half a
-    # pixel inside the true edge.
-    return cx, cy, r + 0.5
+    return pts[on_hull] if on_hull.sum() >= 8 else pts
+
+
+def _arc_span(points: np.ndarray, cx: float, cy: float) -> float:
+    """How many degrees of the circle around (cx, cy) the points cover."""
+    if len(points) < 2:
+        return 0.0
+    angles = np.sort(np.degrees(np.arctan2(points[:, 1] - cy, points[:, 0] - cx)))
+    gaps = np.diff(np.append(angles, angles[0] + 360.0))
+    return float(360.0 - gaps.max())
+
+
+@dataclass
+class LimbFit:
+    """The solar limb traced in one filtered frame."""
+    circle: Tuple[float, float, float]    # (cx, cy, r) in the frame's pixels
+    points: np.ndarray                    # the limb points the circle was fitted to
+    span: float                           # degrees of the limb they cover
+    shape: Tuple[int, int]                # the frame's (height, width)
+
+
+# A Sun with a smaller radius (px) than this is traced on an upsampled copy of
+# its neighbourhood, so that even a 1 px thin crescent yields a smooth limb.
+SMALL_SUN_TRACE_RADIUS = 40.0
+
+
+def _kth_brightest(values: np.ndarray, k: int) -> float:
+    """The k-th largest value: the peak, ignoring up to k - 1 hot pixels."""
+    flat = values.ravel()
+    k = min(max(1, int(k)), flat.size)
+    return float(np.partition(flat, flat.size - k)[flat.size - k])
 
 
 def detect_sun_disc(image_bgr: np.ndarray,
@@ -207,17 +275,37 @@ def detect_sun_disc(image_bgr: np.ndarray,
     Returns (cx, cy, radius) in the frame's own pixels, or None when there is
     no Sun in it (a black frame, or cloud).
     """
+    fit = trace_sun_limb(image_bgr, detect_max_dim)
+    return fit.circle if fit is not None else None
+
+
+def trace_sun_limb(image_bgr: np.ndarray, detect_max_dim: int = 1400) -> Optional[LimbFit]:
+    """
+    Finds the Sun in a filtered frame and fits a circle to its limb.
+
+    Nothing here assumes the Sun fills any particular share of the frame: shot
+    with a short lens, a thin crescent 10 px in radius lights a few dozen
+    pixels out of millions.
+    """
     if image_bgr is None or image_bgr.size == 0:
         return None
     img = _as_float(image_bgr)
+    full_value = _brightness(img)
 
     h, w = img.shape[:2]
     scale = min(1.0, detect_max_dim / float(max(h, w)))
-    small = cv2.resize(img, (max(8, int(w * scale)), max(8, int(h * scale))),
-                       interpolation=cv2.INTER_AREA) if scale < 1.0 else img
-    value = cv2.GaussianBlur(_brightness(small), (3, 3), 0)
+    if scale < 1.0:
+        # Max-pool before shrinking: averaging alone would dim a crescent one
+        # pixel thin into the background.
+        k = int(math.ceil(1.0 / scale))
+        pooled = cv2.dilate(full_value, np.ones((k, k), np.uint8))
+        small = cv2.resize(pooled, (max(8, int(w * scale)), max(8, int(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = full_value
+    value = cv2.GaussianBlur(small, (3, 3), 0)
 
-    peak = float(np.percentile(value, 99.99))
+    peak = _kth_brightest(value, 4)
     floor = float(np.median(value))
     if peak < 0.12 or peak - floor < 0.08:
         return None
@@ -227,15 +315,11 @@ def detect_sun_disc(image_bgr: np.ndarray,
     if count <= 1:
         return None
     # The Sun is the blob with the most light in it, not merely the largest.
-    best, best_score = 0, -1.0
-    for label in range(1, count):
-        area = stats[label, cv2.CC_STAT_AREA]
-        if area < 3:
-            continue
-        score = float(value[labels == label].sum())
-        if score > best_score:
-            best, best_score = label, score
-    if best == 0:
+    light = np.bincount(labels.ravel(), weights=value.ravel(), minlength=count)
+    light[0] = -1.0
+    light[stats[:, cv2.CC_STAT_AREA] < 3] = -1.0
+    best = int(np.argmax(light))
+    if light[best] <= 0:
         return None
 
     x, y, bw, bh = stats[best, :4]
@@ -245,20 +329,110 @@ def detect_sun_disc(image_bgr: np.ndarray,
     y0 = max(0, int(y / scale) - pad)
     x1 = min(w, int((x + bw) / scale) + pad)
     y1 = min(h, int((y + bh) / scale) + pad)
-    window = cv2.GaussianBlur(_brightness(img[y0:y1, x0:x1]), (3, 3), 0)
+    window = full_value[y0:y1, x0:x1]
 
+    radius_guess = 0.5 * max(bw, bh) / scale
+    factor = int(min(8, max(1, math.ceil(SMALL_SUN_TRACE_RADIUS / max(radius_guess, 1.0)))))
+    if factor == 1:
+        window = cv2.GaussianBlur(window, (3, 3), 0)
     local_peak = float(np.percentile(window, 99.9))
     local_floor = float(np.percentile(window, 20))
     if local_peak - local_floor < 0.05:
         return None
-    local_mask = window > local_floor + 0.45 * (local_peak - local_floor)
-    circle = _limb_circle(local_mask)
-    if circle is None:
+    # Limb darkening leaves the Sun's edge at roughly half its centre's
+    # brightness, so the lit limb ends at about a third of the peak; a higher
+    # cut would trace a circle inside the limb. An overexposed Sun hides its
+    # limb darkening and spreads a glow around itself: there the edge is at
+    # half the peak.
+    level = local_floor + 0.3 * (local_peak - local_floor)
+    if local_peak >= 0.98 and float(np.mean(window[window > level] >= 0.98)) >= 0.2:
+        level = local_floor + 0.5 * (local_peak - local_floor)
+
+    if factor == 1:
+        points = _limb_points(window > level)
+    else:
+        # A small Sun: bilinear upsampling turns the threshold into a
+        # sub-pixel iso-line instead of a staircase of whole pixels.
+        wh, ww = window.shape[:2]
+        up = cv2.resize(np.ascontiguousarray(window), (ww * factor, wh * factor),
+                        interpolation=cv2.INTER_LINEAR)
+        points = _limb_points(up > level)
+        if points is not None:
+            points = (points + 0.5) / factor - 0.5
+    if points is None:
         return None
-    cx, cy, r = circle
+    points = points.astype(np.float64) + np.array([x0, y0], np.float64)
+    fit = _robust_fit(points)
+    if fit is None:
+        return None
+    (cx, cy, r), kept = fit
+    # Contour points sit on the centres of the outermost lit (sub)pixels, half
+    # a (sub)pixel inside the true edge: move them out onto it.
+    half = 0.5 / factor
+    radial = kept - np.array([cx, cy])
+    kept = kept + half * radial / np.maximum(np.hypot(radial[:, 0], radial[:, 1]), 1e-9)[:, None]
+    r += half
     if not (2.0 <= r <= max(h, w)):
         return None
-    return cx + x0, cy + y0, r
+    return LimbFit(circle=(float(cx), float(cy), float(r)), points=kept,
+                   span=_arc_span(kept, cx, cy), shape=(h, w))
+
+
+def harmonise_sun_radii(fits: Sequence[Optional[LimbFit]], groups: Optional[Sequence[Any]] = None,
+                        min_span: float = 180.0, tolerance: float = 0.2
+                        ) -> List[Optional[Tuple[float, float, float]]]:
+    """
+    One solar radius for a whole sequence, and each Sun's centre fitted to it.
+
+    The partial frames of a sequence come from the same lens, so the Sun has
+    the same radius in every one of them (its angular size changes by 0.03 %
+    in a day). A thin crescent near totality shows a short stretch of limb
+    whose ends are dimmer than its middle; fitting its radius freely lets the
+    circle shrink and slide towards the crescent — a size error of up to 10 %.
+    The radius is therefore taken from the frames that show at least half of
+    the limb, and only the centre of each thinner crescent is fitted, which
+    even a short arc pins down well.
+
+    Only frames of the same size — and the same entry of `groups`, such as
+    the EXIF focal length — are compared. Within them the reliable radii are
+    clustered, so frames zoomed differently form their own clusters; a thin
+    crescent takes the nearest cluster, and keeps its own fit when none is
+    within `tolerance`.
+    """
+    circles = [f.circle if f is not None else None for f in fits]
+    keys = [(f.shape, groups[i] if groups is not None else None) if f is not None else None
+            for i, f in enumerate(fits)]
+    for key in {k for k in keys if k is not None}:
+        members = [i for i, k in enumerate(keys) if k == key]
+        reliable = sorted(fits[i].circle[2] for i in members if fits[i].span >= min_span)
+        clusters: List[List[float]] = []
+        for radius in reliable:
+            if clusters and radius <= clusters[-1][-1] * 1.1:
+                clusters[-1].append(radius)
+            else:
+                clusters.append([radius])
+        centres = [float(np.median(c)) for c in clusters]
+        for i in members:
+            fit = fits[i]
+            own = fit.circle[2]
+            if fit.span >= min_span or not centres:
+                continue
+            radius = min(centres, key=lambda c: abs(c - own) / c)
+            if abs(own - radius) > tolerance * radius:
+                continue
+            refit = _robust_fit(fit.points, init=fit.circle, fixed_radius=radius)
+            if refit is not None:
+                circles[i] = refit[0]
+    return circles
+
+
+def recentre_cutout(cut: "SunCutout", old_disc: Tuple[float, float, float],
+                    new_disc: Tuple[float, float, float]) -> "SunCutout":
+    """The same crop with a corrected disc (the crop keeps a generous margin)."""
+    cx, cy, _r = cut.disc
+    local = (cx + new_disc[0] - old_disc[0], cy + new_disc[1] - old_disc[1], float(new_disc[2]))
+    level, chroma = measure_sun_surface(cut.crop, local)
+    return SunCutout(crop=cut.crop, disc=local, level=level, chroma=chroma)
 
 
 def detect_totality_disc(image_bgr: np.ndarray,
@@ -378,14 +552,18 @@ def measure_sun_surface(crop_bgr: np.ndarray, disc: Tuple[float, float, float]
     """
     (surface brightness, BGR chroma) of the lit photosphere inside the disc.
 
-    Brightness is the median brightest-channel value of the lit pixels, away
-    from the limb, where limb darkening would pull it down. Chroma is the mean
+    Brightness is the 90th percentile of the lit pixels' brightest channel:
+    the ridge of a crescent, or the bright middle of a fat Sun. The whole disc
+    is searched, because a thin crescent lies entirely in the outer tenth of
+    the radius; and a high percentile, because the light of a crescent
+    thinner than the lens blur is smeared out — a median would read it as
+    dim and the equalisation would then blow it out. Chroma is the mean
     colour of the same pixels scaled so its brightest channel is 1.
     """
     cx, cy, r = disc
     h, w = crop_bgr.shape[:2]
     yy, xx = np.mgrid[0:h, 0:w]
-    inside = (xx - cx) ** 2 + (yy - cy) ** 2 <= (0.9 * r) ** 2
+    inside = (xx - cx) ** 2 + (yy - cy) ** 2 <= (r + 0.5) ** 2
     value = _brightness(crop_bgr)
     if inside.sum() < 4:
         return 1.0, (1.0, 1.0, 1.0)
@@ -394,7 +572,7 @@ def measure_sun_surface(crop_bgr: np.ndarray, disc: Tuple[float, float, float]
     lit = inside & (value > 0.5 * peak)
     if lit.sum() < 4:
         lit = inside
-    level = float(np.median(value[lit]))
+    level = float(np.percentile(value[lit], 90))
     mean = crop_bgr[lit].reshape(-1, 3).mean(axis=0)
     top = float(mean.max())
     chroma = tuple(float(c / top) for c in mean) if top > 1e-6 else (1.0, 1.0, 1.0)

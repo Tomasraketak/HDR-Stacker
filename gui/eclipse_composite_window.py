@@ -41,11 +41,13 @@ from PyQt6.QtWidgets import (
 try:
     from core.eclipse_composite import (
         CompositeSettings, CompositeError, PartialFrame, SunCutout, CalibrationReport,
-        ColorGrade, Placement, apply_grade, load_image_float, detect_sun_disc, detect_totality_disc, cut_out_sun,
+        ColorGrade, Placement, apply_grade, load_image_float, trace_sun_limb,
+        harmonise_sun_radii, recentre_cutout, detect_totality_disc, cut_out_sun,
         calibrate, compute_placements, path_polyline, ecliptic_polyline,
         horizon_polyline, render_composite, frame_gains, format_time,
     )
-    from core.exif_and_analysis import extract_capture_time, extract_gps_position
+    from core.exif_and_analysis import (extract_capture_time, extract_gps_position,
+                                        extract_focal_length)
     from core.solar_position import sun_position
     from core.postprocess import save_image
     from gui.image_viewer import InteractiveImageViewer, ACCENT, TEXT_DIM
@@ -54,11 +56,13 @@ try:
 except ImportError:  # pragma: no cover
     from ..core.eclipse_composite import (
         CompositeSettings, CompositeError, PartialFrame, SunCutout, CalibrationReport,
-        ColorGrade, Placement, apply_grade, load_image_float, detect_sun_disc, detect_totality_disc, cut_out_sun,
+        ColorGrade, Placement, apply_grade, load_image_float, trace_sun_limb,
+        harmonise_sun_radii, recentre_cutout, detect_totality_disc, cut_out_sun,
         calibrate, compute_placements, path_polyline, ecliptic_polyline,
         horizon_polyline, render_composite, frame_gains, format_time,
     )
-    from ..core.exif_and_analysis import extract_capture_time, extract_gps_position
+    from ..core.exif_and_analysis import (extract_capture_time, extract_gps_position,
+                                          extract_focal_length)
     from ..core.solar_position import sun_position
     from ..core.postprocess import save_image
     from .image_viewer import InteractiveImageViewer, ACCENT, TEXT_DIM
@@ -155,8 +159,14 @@ def _load_background(path: str, task: _Task) -> Dict[str, Any]:
 
 def _load_partials(paths: List[str], known_discs: Dict[str, Tuple[float, float, float]],
                    task: _Task) -> List[Dict[str, Any]]:
-    """Decodes each filtered frame once, finds its Sun and keeps only the cut-out."""
+    """
+    Decodes each filtered frame once, finds its Sun and keeps only the cut-out.
+
+    The newly traced Suns are then given one common radius per lens (see
+    harmonise_sun_radii), which keeps thin crescents the right size.
+    """
     results = []
+    traced: List[Tuple[int, Any, Optional[float]]] = []    # (result index, LimbFit, focal)
     for i, path in enumerate(paths):
         if task.cancelled():
             break
@@ -174,13 +184,27 @@ def _load_partials(paths: List[str], known_discs: Dict[str, Tuple[float, float, 
             entry["error"] = "nelze načíst"
             results.append(entry)
             continue
-        disc = known_discs.get(path) or detect_sun_disc(img)
+        disc = known_discs.get(path)
+        if disc is None:
+            fit = trace_sun_limb(img)
+            if fit is not None:
+                disc = fit.circle
+                traced.append((len(results), fit, extract_focal_length(path)))
         if disc is None:
             entry["error"] = "Slunce nenalezeno"
         else:
             entry["disc"] = tuple(float(v) for v in disc)
             entry["cutout"] = cut_out_sun(img, disc)
         results.append(entry)
+
+    if len(traced) > 1 and not task.cancelled():
+        circles = harmonise_sun_radii([fit for _i, fit, _f in traced],
+                                      groups=[focal for _i, _fit, focal in traced])
+        for (i, fit, _focal), circle in zip(traced, circles):
+            if circle is not None and circle != fit.circle:
+                entry = results[i]
+                entry["cutout"] = recentre_cutout(entry["cutout"], fit.circle, circle)
+                entry["disc"] = tuple(float(v) for v in circle)
     return results
 
 

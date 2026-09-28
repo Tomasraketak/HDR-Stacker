@@ -49,7 +49,7 @@ from core.eclipse_composite import (
     SkyCamera, Calibration, CompositeSettings, CompositeError, PartialFrame, solve_camera,
     calibrate, compute_placements, detect_sun_disc, detect_totality_disc, cut_out_sun,
     load_image_float, render_composite, frame_gains, path_polyline, format_time,
-    ColorGrade, apply_grade,
+    ColorGrade, apply_grade, trace_sun_limb, harmonise_sun_radii, recentre_cutout,
 )
 from core.solar_position import _solar_coordinates
 from datetime import datetime, timedelta
@@ -641,8 +641,12 @@ def _write_exif_jpeg(path: str, bgr_u8: np.ndarray, moment: datetime,
 
 
 def _crescent_frame(size=(900, 640), centre=(430.3, 310.6), radius=31.0,
-                    moon_offset=(22.0, -9.0), level=0.9, tint=(1.0, 1.0, 1.0)) -> np.ndarray:
-    """A filtered partial-phase frame: a limb-darkened disc minus the Moon."""
+                    moon_offset=(22.0, -9.0), level=0.9, tint=(1.0, 1.0, 1.0),
+                    blur: float = 0.0, jpeg: bool = False) -> np.ndarray:
+    """
+    A filtered partial-phase frame: a limb-darkened disc minus the Moon,
+    optionally softened by the lens (`blur`, sigma in px) and JPEG-compressed.
+    """
     w, h = size
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
     d = np.hypot(xx - centre[0], yy - centre[1])
@@ -651,8 +655,82 @@ def _crescent_frame(size=(900, 640), centre=(430.3, 310.6), radius=31.0,
     moon = np.clip(np.hypot(xx - centre[0] - moon_offset[0],
                             yy - centre[1] - moon_offset[1]) - radius * 1.03 + 0.5, 0.0, 1.0)
     value = disc * moon * level
+    if blur > 0:
+        value = cv2.GaussianBlur(value, (0, 0), blur)
     bgr = np.dstack([value * tint[0], value * tint[1], value * tint[2]])
-    return np.clip(bgr * 255.0 + 1.5, 0, 255).astype(np.uint8)
+    u8 = np.clip(bgr * 255.0 + 1.5, 0, 255).astype(np.uint8)
+    if jpeg:
+        ok, buf = cv2.imencode(".jpg", u8, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        u8 = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+    return u8
+
+
+def _check_small_suns():
+    """Tiny, thin and overexposed Suns, and one radius for a whole sequence."""
+    # A crescent 10 px in radius and ~1.5 px thin lights a few dozen pixels
+    # of the frame; it must still be found and fitted.
+    centre = (1011.4, 560.7)
+    thin = _crescent_frame((2000, 1333), centre, 10.5, (-2.0, 1.0), level=0.7, blur=0.7, jpeg=True)
+    disc = detect_sun_disc(thin)
+    check(disc is not None and math.hypot(disc[0] - centre[0], disc[1] - centre[1]) < 1.5
+          and abs(disc[2] - 10.5) < 1.2,
+          f"a tiny thin crescent must be found ({disc})")
+
+    # The same in a 24 Mpx frame, where detection runs on a shrunken copy.
+    big = np.full((4000, 6000, 3), 2, np.uint8)
+    patch = _crescent_frame((120, 120), (60.3, 59.6), 12.0, (2.5, 1.0), level=0.65, blur=0.7)
+    big[1700:1820, 3100:3220] = patch
+    disc = detect_sun_disc(big)
+    check(disc is not None and math.hypot(disc[0] - 3160.3, disc[1] - 1759.6) < 1.5,
+          f"a thin crescent in a 24 Mpx frame must be found ({disc})")
+
+    # An overexposed Sun: clipped, with a glow around it.
+    glow = _crescent_frame((400, 300), (200.2, 150.7), 20.0, (30.0, -10.0), level=1.8, blur=1.2)
+    disc = detect_sun_disc(glow)
+    check(disc is not None and abs(disc[2] - 20.0) < 0.8,
+          f"an overexposed Sun must not be measured with its glow ({disc})")
+
+    # A sequence: one fat crescent and thinner ones, all through the same lens.
+    rng = np.random.default_rng(5)
+    truths, fits = [], []
+    for d in (9.0, 4.0, 2.5, 1.8):
+        c = (900.0 + rng.uniform(-200, 200), 600.0 + rng.uniform(-150, 150))
+        ang = rng.uniform(0, 2 * math.pi)
+        frame = _crescent_frame((2000, 1333), c, 10.5, (d * math.cos(ang), d * math.sin(ang)),
+                                level=0.75, blur=0.7, jpeg=True)
+        truths.append(c)
+        fits.append(trace_sun_limb(frame))
+    check(all(f is not None for f in fits), "every crescent of the sequence must be traced")
+    check(fits[0].span >= 180.0 > fits[-1].span,
+          f"the fat crescent must show more of the limb than the thin one "
+          f"({[round(f.span) for f in fits]})")
+    circles = harmonise_sun_radii(fits)
+    radii = [c[2] for c in circles]
+    centre_err = max(math.hypot(c[0] - t[0], c[1] - t[1]) for c, t in zip(circles, truths))
+    free_err = max(abs(f.circle[2] - 10.5) for f in fits)
+    check(max(radii) - min(radii) < 0.05 and abs(radii[0] - 10.5) < 0.5,
+          f"one radius must hold for the whole sequence ({[round(r, 2) for r in radii]})")
+    check(centre_err < 1.0, f"thin crescents must keep an accurate centre ({centre_err:.2f} px)")
+    # A frame zoomed differently, or from another lens, keeps its own radius.
+    zoomed = trace_sun_limb(_crescent_frame((2000, 1333), (1000.0, 600.0), 16.0, (3.0, 0.0),
+                                            level=0.75, blur=0.7))
+    mixed = harmonise_sun_radii(fits + [zoomed])
+    check(abs(mixed[-1][2] - zoomed.circle[2]) < 1e-9, "a differently zoomed frame keeps its size")
+    separate = harmonise_sun_radii(fits, groups=[50.0, 50.0, 50.0, 85.0])
+    check(separate[-1] == fits[-1].circle, "frames with another focal length are not mixed")
+
+    # The cut-out follows the corrected disc.
+    frame = _crescent_frame((2000, 1333), truths[-1], 10.5, (1.8, 0.0), level=0.75)
+    img = frame.astype(np.float32) / 255.0
+    first = trace_sun_limb(frame)
+    cut = cut_out_sun(img, first.circle)
+    moved = (first.circle[0] + 0.7, first.circle[1] - 0.4, 10.5)
+    again = recentre_cutout(cut, first.circle, moved)
+    check(abs(again.disc[0] - cut.disc[0] - 0.7) < 1e-9 and abs(again.disc[2] - 10.5) < 1e-9
+          and again.crop is cut.crop,
+          "re-centring a cut-out must shift its disc, not re-crop it")
+    print(f"   thin crescents: sequence radii {min(radii):.2f}-{max(radii):.2f} px "
+          f"(free fits off by up to {free_err:.2f}), centres within {centre_err:.2f} px")
 
 
 def _composite_scene(tmpdir: str):
@@ -846,6 +924,7 @@ def test_eclipse_composite(tmpdir):
         check(ok, f"{label} crescent: solar disc must be recovered ({disc})")
     check(detect_sun_disc(np.full((300, 400, 3), 2, np.uint8)) is None,
           "a black frame has no Sun")
+    _check_small_suns()
 
     bg = load_image_float(scene["bg_path"])
     check(bg is not None and bg.dtype == np.float32 and bg.shape == (1000, 1600, 3),
