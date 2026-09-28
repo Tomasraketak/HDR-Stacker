@@ -974,7 +974,8 @@ class CompositeSettings:
     horizon: Optional[Tuple[float, float, float, float]] = None
     horizon_altitude: float = 0.0
     scale_mode: str = "auto"
-    clock_offset_s: float = 0.0     # added to every partial frame's timestamp
+    camera_clock_offset_s: float = 0.0   # camera clock error, added to every photo's time
+    clock_offset_s: float = 0.0     # extra for the partial frames only (another camera)
     target_level: float = 0.85      # surface brightness every Sun is equalised to
     sun_grade: ColorGrade = field(default_factory=ColorGrade)          # master, all Suns
     background_grade: ColorGrade = field(default_factory=ColorGrade)   # the totality frame
@@ -1040,13 +1041,50 @@ class CompositeSettings:
 
     @property
     def background_moment(self) -> Optional[datetime]:
-        return parse_time(self.background_time)
+        """The true time of the background: its camera time, clock-corrected."""
+        moment = parse_time(self.background_time)
+        if moment is None:
+            return None
+        return moment + timedelta(seconds=float(self.camera_clock_offset_s))
 
     def frame_moment(self, frame: PartialFrame) -> Optional[datetime]:
+        """The true time of a partial frame: its camera time, clock-corrected."""
         moment = frame.moment
         if moment is None:
             return None
-        return moment + timedelta(seconds=float(self.clock_offset_s))
+        return moment + timedelta(seconds=float(self.camera_clock_offset_s)
+                                  + float(self.clock_offset_s))
+
+    def clock_offset_for(self, true_moment: datetime,
+                         frame: Optional[PartialFrame] = None) -> Optional[float]:
+        """
+        The camera clock correction (s) under which a photo — the background,
+        or `frame` — was taken at `true_moment`: for example a frame showing
+        the start of totality, whose true time a local circumstances table
+        gives to the second. None when that photo has no camera time.
+        """
+        camera_time = parse_time(self.background_time) if frame is None else frame.moment
+        if camera_time is None:
+            return None
+        extra = float(self.clock_offset_s) if frame is not None else 0.0
+        return round((true_moment - camera_time).total_seconds() - extra, 3)
+
+
+def describe_clock_offset(seconds: float) -> str:
+    """'hodiny šly 4 min 43 s napřed' for a correction of -283 s."""
+    magnitude = round(abs(float(seconds)), 1)
+    if magnitude < 0.05:
+        return "bez korekce"
+    hours, rest = divmod(magnitude, 3600.0)
+    minutes, secs = divmod(rest, 60.0)
+    parts = []
+    if hours >= 1:
+        parts.append(f"{int(hours)} h")
+    if minutes >= 1 or hours >= 1:
+        parts.append(f"{int(minutes)} min")
+    parts.append(f"{secs:.0f} s" if abs(secs - round(secs)) < 0.05 else f"{secs:.1f} s")
+    direction = "napřed" if seconds < 0 else "pozadu"
+    return f"hodiny šly {' '.join(parts)} {direction}"
 
 
 def _as_tuple(value: Any, n: int) -> Optional[tuple]:

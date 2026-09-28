@@ -981,6 +981,36 @@ def test_eclipse_composite(tmpdir):
           "each Sun must be drawn at the true solar size")
     print(f"   placement error {worst:.2f} px over a 70-minute sequence")
 
+    # A camera clock running 4 min 43 s fast: the same photos with shifted
+    # EXIF times, plus the correction worked out from the totality photo,
+    # must land exactly where the true times put them.
+    fast = CompositeSettings.from_dict(settings.to_dict())
+    shift = timedelta(minutes=4, seconds=43)
+    fast.background_time = format_time(fast.background_moment + shift)
+    for frame in fast.frames:
+        frame.time = format_time(frame.moment + shift)
+    wrong = compute_placements(fast, calibrate(fast, 1600, 1000).camera)
+    fast.camera_clock_offset_s = fast.clock_offset_for(COMPOSITE_TOTALITY)
+    check(abs(fast.camera_clock_offset_s + 283.0) < 1e-6,
+          f"the clock correction must follow from one known time ({fast.camera_clock_offset_s})")
+    fixed = compute_placements(fast, calibrate(fast, 1600, 1000).camera)
+    drift = max(math.hypot(a.x - b.x, a.y - b.y) for a, b in zip(wrong, placements))
+    residual = max(math.hypot(a.x - b.x, a.y - b.y) for a, b in zip(fixed, placements))
+    check(residual < 1e-6 and fast.background_moment == settings.background_moment,
+          f"a corrected clock must restore every placement ({residual:.2e} px)")
+    # The partial frames' own extra correction touches only them.
+    fast.clock_offset_s = 60.0
+    check(fast.background_moment == settings.background_moment
+          and fast.frame_moment(fast.frames[0]) == settings.frame_moment(settings.frames[0])
+          + timedelta(seconds=60),
+          "the partial-only correction must not move the background")
+    known = fast.frame_moment(fast.frames[1]) - timedelta(seconds=7)
+    check(abs(fast.clock_offset_for(known, fast.frames[1]) - (fast.camera_clock_offset_s - 7.0)) < 1e-6,
+          "syncing on a partial frame must allow for its extra correction")
+    check(CompositeSettings.from_dict({"clock_offset_s": 12.0}).camera_clock_offset_s == 0.0,
+          "older projects must keep their clock as it was")
+    print(f"   a clock 4 min 43 s fast moved the Suns by up to {drift:.1f} px; corrected exactly")
+
     # Rendering: every Sun equalised to the same surface brightness.
     settings.target_level = 0.8
     out = render_composite(bg, settings, cutouts, report.camera)
@@ -1171,6 +1201,33 @@ def test_composite_gui(tmpdir, scene):
         check(bool(overlay.get("path")) and bool(overlay.get("ticks"))
               and len(overlay.get("markers", [])) == 3,
               "the path, its time ticks and the frame markers must be drawn")
+
+        # The camera clock: one correction moves every photo, and the sync
+        # dialog works it out from a photo whose true time is known.
+        editor.set_camera_clock_offset(-283.0)
+        check(s.background_moment == COMPOSITE_TOTALITY - timedelta(seconds=283)
+              and editor.table.item(0, 1).text()
+              == (s.frames[0].moment - timedelta(seconds=283)).strftime("%H:%M:%S")
+              and "napřed" in editor.lbl_clock.text(),
+              f"the clock correction must shift every photo ({editor.lbl_clock.text()})")
+        dialog = ecw.ClockSyncDialog(s, editor)
+        dialog.combo.setCurrentIndex(dialog.combo.findData(-1))
+        check(dialog.true_time.value() == COMPOSITE_TOTALITY - timedelta(seconds=283),
+              "the dialog must start from the time the program believes")
+        # As the user would: typing into the time field.
+        from PyQt6.QtCore import QTime
+        dialog.true_time.time_edit.setTime(QTime(COMPOSITE_TOTALITY.hour, COMPOSITE_TOTALITY.minute,
+                                                 COMPOSITE_TOTALITY.second))
+        check(abs(dialog.offset()) < 1e-6 and "bez korekce" in dialog.lbl_result.text(),
+              f"syncing on the background must give its clock error ({dialog.offset()})")
+        dialog.combo.setCurrentIndex(dialog.combo.findData(1))
+        target = s.frames[1].moment.replace(microsecond=0) + timedelta(seconds=10)
+        dialog.true_time.set_value(target)
+        check(abs(dialog.offset() - (target - s.frames[1].moment).total_seconds()) < 1e-6,
+              "syncing on a partial frame must use its own camera time")
+        dialog.deleteLater()
+        editor.set_camera_clock_offset(0.0)
+        pump(300, lambda: all(p is not None for p in editor._placements))
 
         # Drag a Sun on the canvas, then nudge it with the keyboard.
         place = editor._placements[1]

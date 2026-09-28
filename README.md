@@ -169,8 +169,17 @@ nebo **`Nástroje → Časosběrný kompozit zatmění`** (`Ctrl+T`).
    exportovaný tímto programem. Program sám najde disk Měsíce v koróně (střed i průměr).
    Čas snímku se čte z EXIF; stack z tohoto programu EXIF nemá, takže klikněte na
    **`🕑 Převzít čas z EXIF jiné fotky`** a vyberte jednu z původních expozic úplné fáze.
-   Nastavte časové pásmo (letní čas = UTC+2) a místo — z GPS v EXIF, z nabídky měst na pásu
+   Nastavte **časové pásmo, ve kterém má fotoaparát nastavené hodiny** (letní čas = UTC+2;
+   fotoaparát nastavený na zimní čas = UTC+1) a místo — z GPS v EXIF, z nabídky měst na pásu
    totality 12. 8. 2026, nebo souřadnicemi.
+   - **Hodiny fotoaparátu šly napřed nebo pozadu?** Klikněte na **`⏱ Seřídit…`**, vyberte
+     snímek, u kterého znáte přesný čas, a zadejte ho. Typicky je to fotka začátku úplné fáze,
+     jejíž čas (2. kontakt) najdete v tabulce místních okolností zatmění. Například fotka má
+     v EXIF 19:33:08, ale úplná fáze tam začala v 19:28:25, obojí v UTC+1. Program spočítá
+     **Korekci hodin −283 s** („hodiny šly 4 min 43 s napřed“) a použije ji pro pozadí i
+     všechny srpky. Korekci lze zadat i přímo v sekundách.
+   - Pokud srpky fotil **jiný přístroj** než pozadí, nastavte rozdíl jeho hodin v poli
+     **Srpky navíc** (část 3). Přičte se jen k srpkům.
 2. **Kalibrace** — klikněte na **`〰 Vyznačit horizont`** a táhněte myší podél vzdáleného
    obzoru (co nejdelší úsečka). Slunce je předvyplněné; když ne, **`☀ Vyznačit Slunce`**:
    klik do středu disku a tah k okraji. Z toho program spočítá model fotoaparátu — měřítko
@@ -210,10 +219,10 @@ nebo **`Nástroje → Časosběrný kompozit zatmění`** (`Ctrl+T`).
 Celé nastavení kompozitu se ukládá do projektu `.ahdrproj` spolu s HDR skládáním.
 
 > **Přesnost:** poloha se počítá z efemeridy Slunce (algoritmus Meeus/NOAA, chyba ~0,01°)
-> včetně atmosférické refrakce a ukotvuje se na Slunce v pozadí. Když mají pozadí i srpky
-> čas ze **stejného fotoaparátu**, chyba jeho hodin se téměř vyruší. Pokud pozadí fotil jiný
-> přístroj, nastavte **Korekci hodin**. Slunce se za 2 minuty posune o svůj průměr, proto
-> záleží na sekundách.
+> včetně atmosférické refrakce a ukotvuje se na Slunce v pozadí. Na přesném čase ale záleží
+> i u snímků ze stejného fotoaparátu: výška Slunce nad vyznačeným horizontem se počítá
+> z absolutního času. Hodiny o 4 min 43 s napřed posunuly na testovací scéně Slunce až
+> o 36 px, proto je seřiďte (**`⏱ Seřídit…`**). Slunce se za 2 minuty posune o svůj průměr.
 
 ### Klávesové zkratky
 
@@ -245,8 +254,8 @@ Celé nastavení kompozitu se ukládá do projektu `.ahdrproj` spolu s HDR sklá
 | Export se nepodaří zapsat | Zkontrolujte, že soubor není otevřený v jiném programu a že do složky lze zapisovat. |
 | Chyba při instalaci PyQt6 | Použijte Python 3.12 místo 3.13+. |
 | Kompozit hlásí „Slunce je pod horizontem“ | Zkontrolujte čas pozadí, časové pásmo (letní čas = UTC+2) a polohu. |
-| Průměr Slunce a horizont si odporují | Zkontrolujte výšku horizontu (z kopce je obzor níž) a čas; v nouzi zvolte **Měřítko z: Jen průměr Slunce**. |
-| Srpek sedí vedle dráhy | Nejspíš nesedí čas snímku — upravte ho u vybraného snímku, nebo nastavte **Korekci hodin**. |
+| Průměr Slunce a horizont si odporují | Často jde o špatný čas: zkontrolujte časové pásmo fotoaparátu (UTC+1 / UTC+2) a **Korekci hodin**. Dál výšku horizontu (z kopce je obzor níž); v nouzi zvolte **Měřítko z: Jen průměr Slunce**. |
+| Srpek sedí vedle dráhy | Nejspíš nesedí čas snímku — seřiďte hodiny (**`⏱ Seřídit…`** u pozadí), případně upravte čas u vybraného snímku nebo pole **Srpky navíc**. |
 | Okno se nevejde na obrazovku | Okna se sama zmenší podle plochy monitoru. Ovládací panely lze rolovat, takže tlačítka dole zůstanou vždy dosažitelná. |
 
 Pokud dojde k neočekávané chybě, aplikace ji zobrazí v dialogu (včetně technického

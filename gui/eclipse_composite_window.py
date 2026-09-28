@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QComboBox, QDoubleSpinBox, QCheckBox, QScrollArea, QFrame,
     QSplitter, QProgressBar, QFileDialog, QMessageBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QDateEdit, QTimeEdit,
-    QSizePolicy, QTabWidget
+    QSizePolicy, QTabWidget, QDialogButtonBox
 )
 
 try:
@@ -44,7 +44,8 @@ try:
         ColorGrade, Placement, apply_grade, load_image_float, trace_sun_limb,
         harmonise_sun_radii, recentre_cutout, detect_totality_disc, cut_out_sun,
         calibrate, compute_placements, path_polyline, ecliptic_polyline,
-        horizon_polyline, render_composite, frame_gains, format_time,
+        horizon_polyline, render_composite, frame_gains, format_time, parse_time,
+        describe_clock_offset,
     )
     from core.exif_and_analysis import (extract_capture_time, extract_gps_position,
                                         extract_focal_length)
@@ -59,7 +60,8 @@ except ImportError:  # pragma: no cover
         ColorGrade, Placement, apply_grade, load_image_float, trace_sun_limb,
         harmonise_sun_radii, recentre_cutout, detect_totality_disc, cut_out_sun,
         calibrate, compute_placements, path_polyline, ecliptic_polyline,
-        horizon_polyline, render_composite, frame_gains, format_time,
+        horizon_polyline, render_composite, frame_gains, format_time, parse_time,
+        describe_clock_offset,
     )
     from ..core.exif_and_analysis import (extract_capture_time, extract_gps_position,
                                           extract_focal_length)
@@ -502,6 +504,98 @@ class DateTimeRow(QWidget):
         return datetime(d.year(), d.month(), d.day(), t.hour(), t.minute(), t.second())
 
 
+def _zone_text(hours: float) -> str:
+    return f"UTC{'+' if hours >= 0 else '−'}{abs(hours):g}"
+
+
+class ClockSyncDialog(QDialog):
+    """Works out the camera clock correction from one photo whose true time is known."""
+
+    def __init__(self, settings: CompositeSettings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Seřídit hodiny fotoaparátu")
+        self.settings = settings
+        layout = QVBoxLayout(self)
+        intro = QLabel("Vyberte snímek, u kterého znáte přesný čas — třeba začátek úplné fáze "
+                       "(2. kontakt) z tabulky místních okolností zatmění — a zadejte ho. "
+                       "Rozdíl proti hodinám fotoaparátu se pak započítá u všech snímků.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("Snímek:"), 0, 0)
+        self.combo = QComboBox()
+        background = parse_time(settings.background_time)
+        if background is not None:
+            self.combo.addItem(f"Pozadí (úplná fáze) — {background:%H:%M:%S}", -1)
+        for i, frame in enumerate(settings.frames):
+            if frame.moment is not None:
+                self.combo.addItem(f"#{i + 1} {frame.filename} — {frame.moment:%H:%M:%S}", i)
+        grid.addWidget(self.combo, 0, 1)
+        grid.addWidget(QLabel("Podle fotoaparátu:"), 1, 0)
+        self.lbl_camera = QLabel("")
+        grid.addWidget(self.lbl_camera, 1, 1)
+        grid.addWidget(QLabel("Skutečný čas:"), 2, 0)
+        self.true_time = DateTimeRow()
+        grid.addWidget(self.true_time, 2, 1)
+        zone = QLabel(f"Zadejte ho v pásmu {_zone_text(settings.utc_offset_hours)}, stejném jako "
+                      f"čas fotoaparátu (nastavení Časové pásmo).")
+        zone.setObjectName("StatusHint")
+        zone.setWordWrap(True)
+        grid.addWidget(zone, 3, 0, 1, 2)
+        grid.setColumnStretch(1, 1)
+        layout.addLayout(grid)
+
+        self.lbl_result = QLabel("")
+        self.lbl_result.setWordWrap(True)
+        layout.addWidget(self.lbl_result)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                        | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        self.combo.currentIndexChanged.connect(self._on_reference)
+        self.true_time.changed.connect(self._update_result)
+        self._on_reference()
+        self.setMinimumWidth(460)
+
+    def _reference(self) -> Tuple[Optional[PartialFrame], Optional[datetime]]:
+        """(frame or None for the background, its camera time)."""
+        index = self.combo.currentData()
+        if index is None:
+            return None, None
+        if index < 0:
+            return None, parse_time(self.settings.background_time)
+        frame = self.settings.frames[index]
+        return frame, frame.moment
+
+    def _on_reference(self, *_):
+        frame, camera_time = self._reference()
+        self.lbl_camera.setText(camera_time.strftime("%d.%m.%Y %H:%M:%S") if camera_time else "—")
+        # Start from the time the program currently believes.
+        believed = (self.settings.background_moment if frame is None
+                    else self.settings.frame_moment(frame))
+        self.true_time.set_value(believed)
+        self._update_result()
+
+    def offset(self) -> Optional[float]:
+        frame, camera_time = self._reference()
+        if camera_time is None:
+            return None
+        return self.settings.clock_offset_for(self.true_time.value(), frame)
+
+    def _update_result(self, *_):
+        value = self.offset()
+        ok = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok.setEnabled(value is not None)
+        if value is None:
+            self.lbl_result.setText("Žádný snímek nemá čas pořízení.")
+        else:
+            self.lbl_result.setText(f"Korekce hodin: <b>{value:+.1f} s</b> — "
+                                    f"{describe_clock_offset(value)}.")
+
+
 class GradeEditor(QWidget):
     """Brightness, contrast, mid-tones, saturation and colour balance sliders."""
 
@@ -704,9 +798,9 @@ class EclipseCompositeWindow(QDialog):
 
         grid.addWidget(QLabel("Čas snímku:"), 2, 0)
         self.bg_time = DateTimeRow()
-        self.bg_time.setToolTip("Místní čas pořízení snímku úplné fáze (čte se z EXIF).\n"
-                                "U stacku z tohoto programu EXIF chybí — převezměte čas\n"
-                                "z některé původní expozice tlačítkem níže.")
+        self.bg_time.setToolTip("Čas pořízení snímku úplné fáze podle hodin fotoaparátu\n"
+                                "(čte se z EXIF). U stacku z tohoto programu EXIF chybí —\n"
+                                "převezměte čas z některé původní expozice tlačítkem níže.")
         self.bg_time.changed.connect(self._on_bg_time_changed)
         grid.addWidget(self.bg_time, 2, 1)
 
@@ -723,12 +817,30 @@ class EclipseCompositeWindow(QDialog):
         self.spin_utc.valueChanged.connect(self._on_location_changed)
         grid.addWidget(self.spin_utc, 4, 1)
 
-        grid.addWidget(QLabel("Místo:"), 5, 0)
+        grid.addWidget(QLabel("Korekce hodin:"), 5, 0)
+        clock = QHBoxLayout()
+        self.spin_camera_clock = _spin(-86400.0, 86400.0, 1.0, 1, " s",
+                                       "O kolik opravit čas všech snímků, když hodiny fotoaparátu\n"
+                                       "šly napřed (−) nebo pozadu (+). Platí pro pozadí i srpky.")
+        self.spin_camera_clock.valueChanged.connect(self._on_camera_clock_changed)
+        clock.addWidget(self.spin_camera_clock, 1)
+        self.btn_clock_sync = QPushButton("⏱  Seřídit…")
+        self.btn_clock_sync.setToolTip("Spočítá korekci ze snímku, jehož přesný čas znáte\n"
+                                       "(např. začátek úplné fáze).")
+        self.btn_clock_sync.clicked.connect(self._open_clock_sync)
+        clock.addWidget(self.btn_clock_sync)
+        grid.addLayout(clock, 5, 1)
+        self.lbl_clock = QLabel("")
+        self.lbl_clock.setObjectName("StatusHint")
+        self.lbl_clock.setWordWrap(True)
+        grid.addWidget(self.lbl_clock, 6, 0, 1, 2)
+
+        grid.addWidget(QLabel("Místo:"), 7, 0)
         self.combo_place = QComboBox()
         for name, coords in LOCATION_PRESETS:
             self.combo_place.addItem(name, coords)
         self.combo_place.currentIndexChanged.connect(self._on_place_preset)
-        grid.addWidget(self.combo_place, 5, 1)
+        grid.addWidget(self.combo_place, 7, 1)
 
         coords = QHBoxLayout()
         self.spin_lat = _spin(-90.0, 90.0, 0.01, 5, "°", "Zeměpisná šířka (+ sever)")
@@ -739,13 +851,13 @@ class EclipseCompositeWindow(QDialog):
         coords.addWidget(self.spin_lat, 1)
         coords.addWidget(QLabel("d."))
         coords.addWidget(self.spin_lon, 1)
-        grid.addWidget(QLabel("Souřadnice:"), 6, 0)
-        grid.addLayout(coords, 6, 1)
+        grid.addWidget(QLabel("Souřadnice:"), 8, 0)
+        grid.addLayout(coords, 8, 1)
 
         self.lbl_sunpos = QLabel("")
         self.lbl_sunpos.setObjectName("StatusHint")
         self.lbl_sunpos.setWordWrap(True)
-        grid.addWidget(self.lbl_sunpos, 7, 0, 1, 2)
+        grid.addWidget(self.lbl_sunpos, 9, 0, 1, 2)
         grid.setColumnStretch(1, 1)
         return group
 
@@ -847,11 +959,11 @@ class EclipseCompositeWindow(QDialog):
         layout.addWidget(self.table)
 
         grid = QGridLayout()
-        grid.addWidget(QLabel("Korekce hodin:"), 0, 0)
+        grid.addWidget(QLabel("Srpky navíc:"), 0, 0)
         self.spin_clock = _spin(-7200.0, 7200.0, 1.0, 1, " s",
-                                "Přičte se k času všech částečných snímků.\n"
-                                "Použijte, když pozadí a srpky fotil jiný přístroj,\n"
-                                "nebo když víte, že hodiny fotoaparátu šly napřed/pozadu.")
+                                "Jen když srpky fotil jiný přístroj než pozadí: o kolik\n"
+                                "se jeho hodiny liší navíc. Korekce hodin fotoaparátu\n"
+                                "(v části 1) se přičítá ke všem snímkům.")
         self.spin_clock.valueChanged.connect(self._on_clock_changed)
         grid.addWidget(self.spin_clock, 0, 1)
         grid.setColumnStretch(1, 1)
@@ -1059,9 +1171,10 @@ class EclipseCompositeWindow(QDialog):
         try:
             self.lbl_bg.setText(os.path.basename(s.background_path) if s.background_path
                                 else "Není načteno.")
-            if s.background_moment is not None:
-                self.bg_time.set_value(s.background_moment)
+            if parse_time(s.background_time) is not None:
+                self.bg_time.set_value(parse_time(s.background_time))
             _set_quiet(self.spin_utc, s.utc_offset_hours)
+            _set_quiet(self.spin_camera_clock, s.camera_clock_offset_s)
             _set_quiet(self.spin_lat, s.latitude)
             _set_quiet(self.spin_lon, s.longitude)
             self.combo_place.blockSignals(True)
@@ -1092,6 +1205,7 @@ class EclipseCompositeWindow(QDialog):
             _set_quiet(self.chk_markers, s.show_markers)
         finally:
             self._syncing = False
+        self._update_clock_hint()
         self._rebuild_table()
         self._load_selected_into_editor()
 
@@ -1236,6 +1350,7 @@ class EclipseCompositeWindow(QDialog):
             if not s.background_time:
                 # Something sensible to start editing from.
                 s.background_time = format_time(self.bg_time.value())
+            self._update_clock_hint()
 
         self.lbl_bg.setText(f"{os.path.basename(s.background_path)}  ·  " + "  ·  ".join(notes))
         self.canvas.set_original_size(*self._bg_size)
@@ -1255,6 +1370,7 @@ class EclipseCompositeWindow(QDialog):
             return
         self.settings.background_time = format_time(moment)
         self.bg_time.set_value(moment)
+        self._update_clock_hint()
         if offset is not None:
             self.settings.utc_offset_hours = offset
             _set_quiet(self.spin_utc, offset)
@@ -1269,7 +1385,39 @@ class EclipseCompositeWindow(QDialog):
         if self._syncing:
             return
         self.settings.background_time = format_time(self.bg_time.value())
+        self._update_clock_hint()
         self._schedule_render()
+
+    def _on_camera_clock_changed(self):
+        if self._syncing:
+            return
+        self.settings.camera_clock_offset_s = self.spin_camera_clock.value()
+        self._after_clock_change()
+
+    def set_camera_clock_offset(self, seconds: float):
+        self.settings.camera_clock_offset_s = float(seconds)
+        _set_quiet(self.spin_camera_clock, float(seconds))
+        self._after_clock_change()
+
+    def _after_clock_change(self):
+        self._update_clock_hint()
+        self._rebuild_table()
+        self._schedule_render()
+
+    def _open_clock_sync(self):
+        dialog = ClockSyncDialog(self.settings, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.offset() is not None:
+            self.set_camera_clock_offset(dialog.offset())
+            self.lbl_status.setText(f"⏱ Hodiny seřízeny: {self.settings.camera_clock_offset_s:+.1f} s "
+                                    f"({describe_clock_offset(self.settings.camera_clock_offset_s)}).")
+
+    def _update_clock_hint(self):
+        s = self.settings
+        text = describe_clock_offset(s.camera_clock_offset_s).capitalize()
+        moment = s.background_moment
+        if moment is not None and abs(s.camera_clock_offset_s) >= 0.05:
+            text = f"Skutečný čas pozadí: {moment:%H:%M:%S} · {describe_clock_offset(s.camera_clock_offset_s)}"
+        self.lbl_clock.setText(text + ".")
 
     def _on_place_preset(self, idx: int):
         coords = self.combo_place.itemData(idx)
@@ -1551,7 +1699,7 @@ class EclipseCompositeWindow(QDialog):
         self._syncing = True
         try:
             moment = frame.moment
-            self.frame_time.set_value(moment or self.settings.background_moment)
+            self.frame_time.set_value(moment or parse_time(self.settings.background_time))
             if moment is None:
                 self.lbl_frame_time.setText("⚠ Snímek nemá čas v EXIF — nastavte ho, jinak se "
                                             "nedá umístit.")
