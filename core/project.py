@@ -97,6 +97,9 @@ class Project:
     histogram_visible: bool = False
     # The partial-phase sequence composite (CompositeSettings.to_dict()), or {}.
     eclipse_composite: Dict[str, Any] = field(default_factory=dict)
+    # Retouch brush strokes on the stacked result (RetouchStroke.to_dict()),
+    # in full-resolution pixels of the uncropped frame.
+    retouch: List[Dict[str, Any]] = field(default_factory=list)
     format_version: int = PROJECT_FORMAT_VERSION
     app_note: str = "Astro HDR Stacker project"
 
@@ -283,6 +286,7 @@ def load_project(filepath: str) -> Tuple[Project, List[str]]:
         compare_mode=bool(data.get("compare_mode", False)),
         histogram_visible=bool(data.get("histogram_visible", False)),
         eclipse_composite=composite,
+        retouch=[r for r in (data.get("retouch") or []) if isinstance(r, dict)],
         format_version=version,
     )
     return project, missing

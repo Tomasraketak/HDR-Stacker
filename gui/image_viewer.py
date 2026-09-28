@@ -1,24 +1,31 @@
 """
 Interactive high-performance image viewer with zoom, pan, pixel inspector,
-split comparison, a live histogram, and a seamless real-time ROI crop overlay.
+split comparison, a live histogram, a seamless real-time ROI crop overlay and
+a retouching brush.
 
 All heavy pixel work happens once per update; painting only ever blits cached
 QPixmaps, so panning and zooming stay smooth on large eclipse frames.
 """
 
-from typing import Optional, Tuple
+import math
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QRectF, QRect, QPointF, pyqtSignal
 from PyQt6.QtGui import (
     QImage, QPixmap, QPainter, QWheelEvent, QMouseEvent, QPainterPath,
-    QPen, QColor, QFont, QResizeEvent, QShowEvent, QBrush, QLinearGradient
+    QPen, QColor, QFont, QResizeEvent, QShowEvent, QBrush, QLinearGradient, QKeyEvent
 )
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QSlider, QComboBox, QSizePolicy, QFrame
+    QSlider, QComboBox, QSizePolicy, QFrame, QSpinBox
 )
+
+try:
+    from core.retouch import FEATHER_RADII
+except ImportError:  # pragma: no cover
+    from ..core.retouch import FEATHER_RADII
 
 # Palette shared with styles.py so the canvas and the chrome agree.
 CANVAS_BG = QColor("#0d0f14")
@@ -26,6 +33,9 @@ ACCENT = QColor("#38bdf8")
 ACCENT_DIM = QColor("#0ea5e9")
 TEXT_DIM = QColor("#94a3b8")
 TEXT_BRIGHT = QColor("#e2e8f0")
+BRUSH_STROKE = QColor(239, 68, 68, 110)
+
+RETOUCH_HINT = "Retuš: táhněte přes předmět · [ ] velikost štětce · pravým tlačítkem posun"
 
 
 def _numpy_rgb_to_pixmap(rgb: np.ndarray) -> QPixmap:
@@ -48,6 +58,9 @@ class InteractiveImageViewer(QWidget):
     pixel_hovered = pyqtSignal(int, int, int, int, int)   # x, y, r, g, b
     roi_selected = pyqtSignal(int, int, int, int)          # x, y, w, h in scene coords
     crop_selected = pyqtSignal(int, int, int, int)         # x, y, w, h in scene coords
+    # A finished brush stroke: [(x, y), ...] pixel centres in scene coords, radius.
+    retouch_stroke = pyqtSignal(object, float)
+    brush_radius_changed = pyqtSignal(float)
 
     MIN_ZOOM = 0.02
     MAX_ZOOM = 40.0
@@ -87,6 +100,12 @@ class InteractiveImageViewer(QWidget):
 
         self._show_histogram: bool = False
         self._histogram: Optional[np.ndarray] = None   # shape (3, 128), normalised
+
+        # Retouching brush.
+        self._retouch_enabled: bool = False
+        self._brush_radius: float = 12.0               # scene pixels
+        self._stroke: Optional[List[Tuple[float, float]]] = None
+        self._brush_pos: Optional[QPointF] = None      # widget position of the cursor
 
         self.setMouseTracking(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -225,6 +244,71 @@ class InteractiveImageViewer(QWidget):
         self._needs_fit = False
         self.update()
 
+    # ---------------------------------------------------------------- Retouch
+
+    def set_retouch_mode(self, enabled: bool):
+        """Left-dragging paints retouch strokes instead of panning."""
+        self._retouch_enabled = bool(enabled)
+        self._stroke = None
+        if enabled:
+            self.setCursor(Qt.CursorShape.BlankCursor)   # the brush circle is the cursor
+        else:
+            self._brush_pos = None
+            self.setCursor(Qt.CursorShape.CrossCursor if self._roi_enabled
+                           else Qt.CursorShape.ArrowCursor)
+        self.update()
+
+    def retouch_mode(self) -> bool:
+        return self._retouch_enabled
+
+    def set_brush_radius(self, radius: float):
+        self._brush_radius = float(np.clip(radius, 0.5, 2000.0))
+        self.update()
+
+    def brush_radius(self) -> float:
+        return self._brush_radius
+
+    def _scene_point(self, pos: QPointF) -> Tuple[float, float]:
+        """Widget position to scene coordinates, pixel centres at whole numbers."""
+        z = max(self._zoom, 1e-6)
+        return ((pos.x() - self._pan_pos.x()) / z - 0.5,
+                (pos.y() - self._pan_pos.y()) / z - 0.5)
+
+    def _screen_point(self, x: float, y: float) -> QPointF:
+        return QPointF(self._pan_pos.x() + (x + 0.5) * self._zoom,
+                       self._pan_pos.y() + (y + 0.5) * self._zoom)
+
+    def _paint_retouch(self, painter: QPainter):
+        """The stroke being painted, and the brush outline as the cursor."""
+        if not self._retouch_enabled:
+            return
+        painter.save()
+        radius = self._brush_radius * self._zoom
+        if self._stroke:
+            painter.setPen(QPen(BRUSH_STROKE, max(1.0, 2.0 * radius), Qt.PenStyle.SolidLine,
+                                Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            if len(self._stroke) == 1:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(BRUSH_STROKE)
+                painter.drawEllipse(self._screen_point(*self._stroke[0]), radius, radius)
+            else:
+                path = QPainterPath(self._screen_point(*self._stroke[0]))
+                for x, y in self._stroke[1:]:
+                    path.lineTo(self._screen_point(x, y))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(path)
+        if self._brush_pos is not None:
+            centre = self._brush_pos
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for width, colour in ((3.0, QColor(0, 0, 0, 150)), (1.2, QColor(255, 255, 255, 230))):
+                painter.setPen(QPen(colour, width))
+                painter.drawEllipse(centre, radius, radius)
+            # The soft edge: the retouch fades out over this outer ring.
+            painter.setPen(QPen(QColor(255, 255, 255, 120), 1.0, Qt.PenStyle.DashLine))
+            outer = radius * (1.0 + FEATHER_RADII)
+            painter.drawEllipse(centre, outer, outer)
+        painter.restore()
+
     # ------------------------------------------------------------- Output crop
 
     def set_crop_rect(self, rect: Optional[Tuple[int, int, int, int]]):
@@ -350,6 +434,7 @@ class InteractiveImageViewer(QWidget):
         if self._show_histogram and self._histogram is not None:
             self._paint_histogram(painter)
 
+        self._paint_retouch(painter)
         self._paint_status_pill(painter)
 
     def _paint_background(self, painter: QPainter):
@@ -562,6 +647,8 @@ class InteractiveImageViewer(QWidget):
     def _paint_status_pill(self, painter: QPainter):
         mode = "Režim výřezu — klikněte na Slunce" if self._roi_enabled else "Levé tlačítko: posun"
         text = f"Zoom {int(self._zoom * 100)} %   ·   {mode}   ·   Kolečko: zoom   ·   Dvojklik: přizpůsobit"
+        if self._retouch_enabled:
+            text = f"Zoom {int(self._zoom * 100)} %   ·   {RETOUCH_HINT}"
 
         painter.setFont(QFont("Segoe UI", 9))
         metrics = painter.fontMetrics()
@@ -612,6 +699,12 @@ class InteractiveImageViewer(QWidget):
     def mousePressEvent(self, event: QMouseEvent):
         pos = event.position()
 
+        if (event.button() == Qt.MouseButton.LeftButton and self._retouch_enabled
+                and self._base_pixmap is not None):
+            self._stroke = [self._scene_point(pos)]
+            self.update()
+            return
+
         if event.button() == Qt.MouseButton.LeftButton and self._crop_select_mode:
             raw = self._screen_to_scene_unclamped(pos)
             self._crop_drag_origin = self._clamp_to_scene(*raw)
@@ -634,6 +727,20 @@ class InteractiveImageViewer(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent):
         pos = event.position()
+
+        if self._retouch_enabled:
+            self._brush_pos = pos
+            if self._stroke is not None:
+                point = self._scene_point(pos)
+                last = self._stroke[-1]
+                # Points a fifth of the brush apart trace the path faithfully
+                # without bloating the project file.
+                if math.hypot(point[0] - last[0], point[1] - last[1]) >= max(0.5, 0.2 * self._brush_radius):
+                    self._stroke.append(point)
+                self.update()
+                self._emit_hover(pos)
+                return
+            self.update()
 
         if self._crop_select_mode and self._crop_drag_origin is not None:
             # Clamped, not rejected: dragging past the image edge should pin the
@@ -672,6 +779,15 @@ class InteractiveImageViewer(QWidget):
         self.pixel_hovered.emit(img_x, img_y, int(r), int(g), int(b))
 
     def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton and self._stroke is not None:
+            points, self._stroke = self._stroke, None
+            end = self._scene_point(event.position())
+            if math.hypot(end[0] - points[-1][0], end[1] - points[-1][1]) > 0.1:
+                points.append(end)
+            self.update()
+            self.retouch_stroke.emit(points, self._brush_radius)
+            return
+
         if event.button() == Qt.MouseButton.LeftButton and self._crop_select_mode:
             pending = self._pending_crop()
             self._crop_drag_origin = None
@@ -689,8 +805,26 @@ class InteractiveImageViewer(QWidget):
         if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton,
                               Qt.MouseButton.MiddleButton):
             self._is_panning = False
-            self.setCursor(Qt.CursorShape.CrossCursor if self._roi_enabled
-                           else Qt.CursorShape.ArrowCursor)
+            if self._retouch_enabled:
+                self.setCursor(Qt.CursorShape.BlankCursor)
+            else:
+                self.setCursor(Qt.CursorShape.CrossCursor if self._roi_enabled
+                               else Qt.CursorShape.ArrowCursor)
+
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if self._brush_pos is not None:
+            self._brush_pos = None
+            self.update()
+
+    def keyPressEvent(self, event: QKeyEvent):
+        """[ and ] resize the retouch brush, as in most photo editors."""
+        if self._retouch_enabled and event.key() in (Qt.Key.Key_BracketLeft, Qt.Key.Key_BracketRight):
+            factor = 1.25 if event.key() == Qt.Key.Key_BracketRight else 1.0 / 1.25
+            self.set_brush_radius(self._brush_radius * factor)
+            self.brush_radius_changed.emit(self._brush_radius)
+            return
+        super().keyPressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if self._roi_enabled and self._roi_rect is not None:
@@ -704,6 +838,9 @@ class ImageViewerContainer(QWidget):
 
     roi_mode_toggled = pyqtSignal(bool, int, int, int, int)
     center_sun_requested = pyqtSignal()
+    retouch_toggled = pyqtSignal(bool)
+    retouch_undo_requested = pyqtSignal()
+    retouch_clear_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -720,7 +857,9 @@ class ImageViewerContainer(QWidget):
 
         self.lbl_info = QLabel("Připraveno")
         self.lbl_info.setObjectName("PixelReadout")
-        self.lbl_info.setMinimumWidth(230)
+        # May narrow on a small screen: the toolbar buttons matter more than
+        # the full pixel readout.
+        self.lbl_info.setMinimumWidth(140)
         top_bar.addWidget(self.lbl_info)
         top_bar.addStretch()
 
@@ -750,6 +889,38 @@ class ImageViewerContainer(QWidget):
         self.btn_zoom_roi.setVisible(False)
         self.btn_zoom_roi.clicked.connect(lambda: self.viewer.zoom_to_roi())
         top_bar.addWidget(self.btn_zoom_roi)
+
+        self.btn_retouch = self._tool_button(
+            "🩹 Retuš", checkable=True,
+            tip="Štětec, který z oblohy odstraní stébla trávy, ptáky nebo prach —\n"
+                "přetřené místo se doplní okolní oblohou i se zrnem.\n"
+                "Pravým tlačítkem myši posunete pohled, klávesy [ a ] mění\n"
+                "velikost štětce, Ctrl+Z vrátí poslední tah.")
+        self.btn_retouch.toggled.connect(self._on_retouch_toggled)
+        top_bar.addWidget(self.btn_retouch)
+
+        self.spin_brush = QSpinBox()
+        self.spin_brush.setRange(1, 1000)
+        self.spin_brush.setValue(12)
+        self.spin_brush.setSuffix(" px")
+        self.spin_brush.setToolTip("Poloměr štětce v pixelech plného rozlišení.\n"
+                                   "Okraj štětce je měkký — účinek slábne až do\n"
+                                   "čárkovaného kruhu.")
+        self.spin_brush.setFixedHeight(30)
+        self.spin_brush.setVisible(False)
+        self.spin_brush.valueChanged.connect(lambda v: self.viewer.set_brush_radius(float(v)))
+        top_bar.addWidget(self.spin_brush)
+
+        self.btn_retouch_undo = self._tool_button("↶ Zpět", tip="Vrátit poslední tah retuše (Ctrl+Z)")
+        self.btn_retouch_undo.setVisible(False)
+        self.btn_retouch_undo.clicked.connect(self.retouch_undo_requested.emit)
+        top_bar.addWidget(self.btn_retouch_undo)
+
+        self.btn_retouch_clear = self._tool_button("🗑", tip="Smazat celou retuš")
+        self.btn_retouch_clear.setFixedWidth(38)
+        self.btn_retouch_clear.setVisible(False)
+        self.btn_retouch_clear.clicked.connect(self.retouch_clear_requested.emit)
+        top_bar.addWidget(self.btn_retouch_clear)
 
         top_bar.addWidget(self._separator())
 
@@ -784,6 +955,8 @@ class ImageViewerContainer(QWidget):
         self.viewer = InteractiveImageViewer(self)
         self.viewer.pixel_hovered.connect(self._on_pixel_hovered)
         self.viewer.roi_selected.connect(self._on_viewer_roi_selected)
+        self.viewer.brush_radius_changed.connect(self._on_brush_radius_changed)
+        self.viewer.set_brush_radius(float(self.spin_brush.value()))
         layout.addWidget(self.viewer, 1)
 
     @staticmethod
@@ -808,7 +981,23 @@ class ImageViewerContainer(QWidget):
         self.split_slider.setVisible(checked)
         self.viewer.set_compare_mode(checked)
 
+    def _on_retouch_toggled(self, checked: bool):
+        # Retouching paints on the whole scene; the ROI patch would hide it.
+        if checked and self.btn_roi_toggle.isChecked():
+            self.btn_roi_toggle.setChecked(False)
+        for widget in (self.spin_brush, self.btn_retouch_undo, self.btn_retouch_clear):
+            widget.setVisible(checked)
+        self.viewer.set_retouch_mode(checked)
+        self.retouch_toggled.emit(checked)
+
+    def _on_brush_radius_changed(self, radius: float):
+        self.spin_brush.blockSignals(True)
+        self.spin_brush.setValue(int(round(radius)))
+        self.spin_brush.blockSignals(False)
+
     def _on_roi_toggled(self, checked: bool):
+        if checked and self.btn_retouch.isChecked():
+            self.btn_retouch.setChecked(False)
         for widget in (self.combo_roi_size, self.btn_find_sun, self.btn_zoom_roi):
             widget.setVisible(checked)
         self.viewer.set_roi_enabled(checked)

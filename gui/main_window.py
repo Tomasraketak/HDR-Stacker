@@ -36,6 +36,8 @@ try:
                               build_project, save_project, load_project,
                               resolved_paths, apply_frame_records)
     from core.eclipse_composite import CompositeSettings
+    from core.retouch import (RetouchStroke, RetouchCache, apply_retouch, count_strokes,
+                              strokes_to_data, strokes_from_data)
     from gui.eclipse_composite_window import EclipseCompositeWindow
     from gui.exposure_list_widget import ExposureListWidget
     from gui.image_viewer import ImageViewerContainer
@@ -54,6 +56,8 @@ except ImportError:  # pragma: no cover
                                 build_project, save_project, load_project,
                                 resolved_paths, apply_frame_records)
     from ..core.eclipse_composite import CompositeSettings
+    from ..core.retouch import (RetouchStroke, RetouchCache, apply_retouch, count_strokes,
+                                strokes_to_data, strokes_from_data)
     from .eclipse_composite_window import EclipseCompositeWindow
     from .exposure_list_widget import ExposureListWidget
     from .image_viewer import ImageViewerContainer
@@ -347,9 +351,11 @@ class FullResExportWorker(_CancellableWorker):
         export_filepath: str,
         export_scale: float = 1.0,
         crop_rect: Optional[Tuple[int, int, int, int]] = None,
+        retouch: Optional[List[RetouchStroke]] = None,
     ):
         super().__init__()
         self.crop_rect = crop_rect
+        self.retouch = list(retouch or [])
         self.frames = [
             (it.filepath, it.filename, float(it.exposure_time), float(it.shift_x), float(it.shift_y))
             for it in items
@@ -466,6 +472,15 @@ class FullResExportWorker(_CancellableWorker):
         if self.cancelled():
             return
 
+        if self.retouch:
+            # Before post-processing, exactly as the preview does it.
+            self.emit_progress(85, f"Retuš ({count_strokes(len(self.retouch))}) v plném rozlišení...")
+            origin = (self.crop_rect[0], self.crop_rect[1]) if self.crop_rect else (0, 0)
+            base_merged = apply_retouch(base_merged, self.retouch, scale=self.export_scale,
+                                        offset=origin, should_cancel=self.cancelled, copy=False)
+            if self.cancelled():
+                return
+
         self.emit_progress(88, "Aplikace postprocessingu a barev v plné kvalitě...")
         final_proc = apply_postprocessing(
             base_merged,
@@ -553,6 +568,12 @@ class MainWindow(QMainWindow):
         self._roi_rect: Optional[Tuple[int, int, int, int]] = None
         # User-defined output crop, in original full-resolution coordinates.
         self._crop_rect: Optional[Tuple[int, int, int, int]] = None
+        # Retouch strokes, in full-resolution pixels of the uncropped frame, and
+        # the preview they were last healed into.
+        self._retouch_strokes: List[RetouchStroke] = []
+        self._retouch_cache = RetouchCache()
+        # Full-resolution size of the scene the preview shows (after the crop).
+        self._scene_full_size: Tuple[int, int] = (0, 0)
 
         # The partial-phase sequence composite lives beside the HDR stack and is
         # saved in the same project file.
@@ -594,6 +615,10 @@ class MainWindow(QMainWindow):
         self.viewer_container.roi_mode_toggled.connect(self._on_roi_mode_toggled)
         self.viewer_container.center_sun_requested.connect(self._center_roi_on_sun)
         self.viewer_container.viewer.crop_selected.connect(self._on_crop_drawn)
+        self.viewer_container.viewer.retouch_stroke.connect(self._on_retouch_stroke)
+        self.viewer_container.retouch_toggled.connect(self._on_retouch_toggled)
+        self.viewer_container.retouch_undo_requested.connect(self.undo_retouch)
+        self.viewer_container.retouch_clear_requested.connect(self.clear_retouch)
         splitter.addWidget(self.viewer_container)
 
         self.controls = ControlsPanel()
@@ -715,6 +740,7 @@ class MainWindow(QMainWindow):
         add("Ctrl+M", self.open_manual_alignment)
         add("Ctrl+0", lambda: self.viewer_container.viewer.fit_to_window())
         add("Ctrl+1", lambda: self.viewer_container.viewer.actual_size_100())
+        add("Ctrl+Z", self.undo_retouch)
 
     def _update_memory_readout(self):
         avail = available_memory_bytes()
@@ -890,6 +916,7 @@ class MainWindow(QMainWindow):
             compare_mode=self.viewer_container.btn_split.isChecked(),
             histogram_visible=self.viewer_container.btn_hist.isChecked(),
             eclipse_composite=self._composite_payload(),
+            retouch=strokes_to_data(self._retouch_strokes),
         )
 
     def _composite_payload(self) -> Dict[str, Any]:
@@ -951,6 +978,9 @@ class MainWindow(QMainWindow):
         self.viewer_container.btn_roi_toggle.setChecked(False)
         self.controls.reset_adjustments()
         self._crop_rect = None
+        self._retouch_strokes = []
+        self._retouch_cache.clear()
+        self.viewer_container.btn_retouch.setChecked(False)
         self._base_merged_bgr = None
         self._preview_base_bgr = None
         self._hdr_radiance_map = None
@@ -1060,6 +1090,8 @@ class MainWindow(QMainWindow):
         self.controls.set_preset_name(project.preset_name)
         self._crop_rect = project.crop_rect or _as_saved_rect(project.settings.get('crop_rect'))
         self.viewer_container.viewer.set_crop_rect(None)
+        self._retouch_strokes = strokes_from_data(project.retouch)
+        self._retouch_cache.clear()
 
         self.viewer_container.btn_hist.setChecked(project.histogram_visible)
         self.viewer_container.btn_split.setChecked(project.compare_mode)
@@ -1166,6 +1198,9 @@ class MainWindow(QMainWindow):
         overlay rectangle would no longer line up with what is on screen.
         """
         viewer = self.viewer_container.viewer
+        if active:
+            # Composing a crop shows the unprocessed frame: nothing to retouch.
+            self.viewer_container.btn_retouch.setChecked(False)
         viewer.set_crop_select_mode(active)
 
         if active:
@@ -1338,6 +1373,7 @@ class MainWindow(QMainWindow):
 
         if orig_w > 0 and orig_h > 0:
             self.viewer_container.viewer.set_original_size(orig_w, orig_h)
+            self._scene_full_size = (int(orig_w), int(orig_h))
 
         # The preview now *is* the cropped region, so its own coordinate space
         # starts at the crop corner. Drawing the crop rectangle on top of it
@@ -1397,7 +1433,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------- Live post-processing
 
     def _apply_postprocessing_live(self):
-        source = self._preview_base_bgr
+        source = self._retouched_preview()
         if source is None:
             return
 
@@ -1424,6 +1460,67 @@ class MainWindow(QMainWindow):
             self.viewer_container.viewer.set_roi_crop_bgr_float(proc, rx, ry, rw, rh)
         else:
             self.viewer_container.viewer.set_base_image_bgr_float(proc, keep_view=True)
+
+    # ------------------------------------------------------------- Retouch
+
+    def _retouched_preview(self) -> Optional[np.ndarray]:
+        """The preview stack with the retouch healed in (cached between slider moves)."""
+        base = self._preview_base_bgr
+        if base is None or not self._retouch_strokes:
+            return base
+        ox, oy = (self._crop_rect[0], self._crop_rect[1]) if self._crop_rect else (0, 0)
+        width = base.shape[1]
+        if self._roi_active and self._roi_rect is not None:
+            rx, ry, rw, _rh = self._roi_rect
+            scale, origin = width / float(max(1, rw)), (ox + rx, oy + ry)
+        else:
+            scene_w = self._scene_full_size[0] or width
+            scale, origin = width / float(scene_w), (ox, oy)
+        try:
+            return self._retouch_cache.result(base, self._retouch_strokes, scale, origin)
+        except Exception as e:  # a retouch must never take the preview down
+            self.lbl_status.setText(f"❌ Retuš selhala: {e}")
+            return base
+
+    def _on_retouch_toggled(self, active: bool):
+        if active:
+            self.lbl_status.setText(
+                "🩹 Retuš: přetřete stéblo nebo jiný předmět na obloze — zmizí a doplní se okolní "
+                "obloha. Pravým tlačítkem posun, [ ] velikost štětce, Ctrl+Z zpět.")
+
+    def _on_retouch_stroke(self, points, radius: float):
+        if self._preview_base_bgr is None:
+            self.lbl_status.setText("Retušovat jde až složený snímek — nejdřív ho složte (Ctrl+R).")
+            return
+        ox, oy = (self._crop_rect[0], self._crop_rect[1]) if self._crop_rect else (0, 0)
+        # The viewer shows the cropped frame; strokes are kept against the
+        # uncropped one, so changing the crop later leaves them in place.
+        self._retouch_strokes.append(
+            RetouchStroke([(float(x) + ox, float(y) + oy) for x, y in points], float(radius)))
+        self._apply_postprocessing_live()
+        self.lbl_status.setText(f"🩹 Retuš: {count_strokes(len(self._retouch_strokes))} · "
+                                "Ctrl+Z vrátí poslední.")
+
+    def undo_retouch(self):
+        if not self._retouch_strokes:
+            return
+        self._retouch_strokes.pop()
+        self._apply_postprocessing_live()
+        self.lbl_status.setText(f"↶ Tah retuše vrácen. Zbývá {len(self._retouch_strokes)}.")
+
+    def clear_retouch(self):
+        if not self._retouch_strokes:
+            return
+        reply = QMessageBox.question(
+            self, "Smazat retuš",
+            f"Smazat celou retuš ({count_strokes(len(self._retouch_strokes))})?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._retouch_strokes = []
+        self._apply_postprocessing_live()
+        self.lbl_status.setText("🗑 Retuš smazána.")
 
     # -------------------------------------------------------------- Export
 
@@ -1497,7 +1594,8 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText(f"Probíhá výpočet a export do {os.path.basename(filepath)}...")
 
         worker = FullResExportWorker(items, self.controls.get_settings(), filepath,
-                                     export_scale, crop_rect=self._crop_rect)
+                                     export_scale, crop_rect=self._crop_rect,
+                                     retouch=self._retouch_strokes)
         worker.progress.connect(self._on_worker_progress)
         worker.finished_success.connect(self._on_export_success)
         worker.failed.connect(self._on_export_failed)

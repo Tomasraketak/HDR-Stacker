@@ -52,6 +52,8 @@ from core.eclipse_composite import (
     ColorGrade, apply_grade, trace_sun_limb, harmonise_sun_radii, recentre_cutout,
 )
 from core.solar_position import _solar_coordinates
+from core.retouch import (RetouchStroke, RetouchCache, apply_retouch,
+                          strokes_to_data, strokes_from_data, FEATHER_RADII)
 from datetime import datetime, timedelta
 
 _FAILURES = []
@@ -1272,6 +1274,29 @@ def test_composite_gui(tmpdir, scene):
         check(editor._bg_graded is cached, "a Sun-only change must not re-grade the background")
         editor.grade_background.reset()
         check(s.background_grade == ColorGrade(), "the reset must clear the background grade")
+
+        # Retouch brush on the background.
+        editor.btn_tool_horizon.setChecked(True)
+        editor.btn_retouch.setChecked(True)
+        check(editor.canvas.retouch_mode() and editor.canvas.tool() == ecw.CompositeCanvas.TOOL_NONE,
+              "the brush must replace the calibration tools")
+        pump(300)
+        plain_bg = editor._graded_background().copy()
+        editor.canvas.retouch_stroke.emit([(300.0, 150.0), (360.0, 200.0)], 8.0)
+        pump(200)
+        healed_bg = editor._graded_background()
+        changed = np.any(np.abs(healed_bg - plain_bg) > 1e-6, axis=2)
+        ys, xs = np.nonzero(changed)
+        check(len(s.retouch) == 1 and changed.any() and 280 <= xs.min() and xs.max() <= 380
+              and 130 <= ys.min() and ys.max() <= 220,
+              "a stroke must heal the background right where it was painted")
+        editor.undo_retouch()
+        pump(200)
+        check(not s.retouch and np.array_equal(editor._graded_background(), plain_bg),
+              "undo must restore the background exactly")
+        editor.canvas.retouch_stroke.emit([(300.0, 150.0), (360.0, 200.0)], 8.0)
+        editor.btn_retouch.setChecked(False)
+        check(not editor.canvas.retouch_mode(), "the brush must switch off")
         editor.combo_blend.setCurrentIndex(editor.combo_blend.findData("normal"))
         check(s.blend_mode == "normal", "the blend mode must be applied")
         editor.chk_ecliptic.setChecked(True)
@@ -1297,8 +1322,9 @@ def test_composite_gui(tmpdir, scene):
         check(len(window._composite_settings.frames) == 3
               and window._composite_settings.horizon is not None
               and abs(window._composite_settings.frames[1].grade.exposure - 0.5) < 1e-6
-              and window._composite_settings.sun_grade.saturation == -40.0,
-              "the composite must be restored from the project, grades included")
+              and window._composite_settings.sun_grade.saturation == -40.0
+              and len(window._composite_settings.retouch) == 1,
+              "the composite must be restored from the project, grades and retouch included")
 
         window.open_eclipse_composite()
         reopened = window._composite_window
@@ -1702,6 +1728,210 @@ def test_gui(paths):
 
 # ------------------------------------------------------------------- Runner
 
+# ------------------------------------------------------------------ Retouch
+
+def _sky_with_stalk(w: int = 320, h: int = 240, seed: int = 11):
+    """A noisy twilight sky gradient, and the same sky behind a blurred grass blade."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    sky = np.dstack([0.45 - 0.25 * yy / h + 0.05 * xx / w,
+                     0.30 - 0.12 * yy / h,
+                     0.15 + 0.20 * yy / h]).astype(np.float32)
+    clean = np.clip(sky + rng.normal(0.0, 0.012, sky.shape).astype(np.float32), 0.0, 1.0)
+    blade = np.zeros((h, w), np.float32)
+    cv2.line(blade, (90, 20), (150, 230), 1.0, 3, cv2.LINE_AA)
+    blade = cv2.GaussianBlur(blade, (0, 0), 2.0)
+    blade /= blade.max()
+    dirty = np.clip(clean * (1.0 - 0.45 * blade[:, :, None]), 0.0, 1.0)
+    stroke = RetouchStroke([(90.0 + 60.0 * t / 20.0, 20.0 + 210.0 * t / 20.0) for t in range(21)], 6.0)
+    return clean, dirty, blade, stroke
+
+
+def test_retouch():
+    section("9a. Retouch — healing grass out of the sky")
+    clean, dirty, blade, stroke = _sky_with_stalk()
+    healed = apply_retouch(dirty, [stroke])
+
+    # No ghost: the local light level matches the clean sky, where the blade
+    # darkened it by up to ~13 %.
+    area = blade > 0.05
+    low = lambda a: cv2.GaussianBlur(a, (0, 0), 4.0)
+    ghost = np.abs(low(healed) - low(clean))[area]
+    before = np.abs(low(dirty) - low(clean))[area]
+    check(float(ghost.max()) < 0.012 and float(ghost.mean()) < 0.004,
+          f"no ghost of the blade may remain (max {ghost.max():.4f}, was {before.max():.4f})")
+    # Grain: the healed strip is as noisy as the sky, not suspiciously smooth.
+    fine = lambda a: a - cv2.GaussianBlur(a, (0, 0), 2.5)
+    core = blade > 0.5
+    ratio = float(fine(healed)[core].std() / fine(clean)[core].std())
+    check(0.6 < ratio < 1.5, f"the fill must carry the sky's grain (noise ratio {ratio:.2f})")
+    # Far from the brush nothing changes.
+    yy, xx = np.mgrid[0:dirty.shape[0], 0:dirty.shape[1]]
+    ax, ay, bx, by = 90.0, 20.0, 150.0, 230.0
+    t = np.clip(((xx - ax) * (bx - ax) + (yy - ay) * (by - ay)) / ((bx - ax) ** 2 + (by - ay) ** 2), 0, 1)
+    dist = np.hypot(xx - (ax + t * (bx - ax)), yy - (ay + t * (by - ay)))
+    far = dist > stroke.radius * (1.0 + FEATHER_RADII) + 2.0
+    check(np.array_equal(healed[far], dirty[far]), "pixels beyond the soft brush edge must not change")
+    check(np.array_equal(apply_retouch(dirty, [RetouchStroke([(900.0, 900.0)], 5.0)]), dirty),
+          "a stroke off the image must change nothing")
+
+    # A half-size preview heals the same way as the full-size export.
+    small = cv2.resize(dirty, (160, 120), interpolation=cv2.INTER_AREA)
+    preview = apply_retouch(small, [stroke], scale=0.5)
+    export = cv2.resize(healed, (160, 120), interpolation=cv2.INTER_AREA)
+    gap = float(np.abs(low(preview) - low(export)).max())
+    check(gap < 0.012, f"the preview and the export must agree ({gap:.4f})")
+    # A crop or ROI: the same stroke, with the patch's own origin.
+    patch = dirty[40:200, 60:220].copy()
+    healed_patch = apply_retouch(patch, [stroke], offset=(60.0, 40.0))
+    check(float(np.abs(low(healed_patch) - low(healed[40:200, 60:220]))[20:-20, 20:-20].max()) < 0.012,
+          "a stroke must land in the right place inside a crop")
+
+    # The preview cache: new strokes heal incrementally, undo is exact.
+    second = RetouchStroke([(250.0, 40.0), (260.0, 120.0)], 5.0)
+    cache = RetouchCache()
+    both = cache.result(dirty, [stroke, second]).copy()
+    v2 = cache.version
+    check(np.array_equal(both, apply_retouch(dirty, [stroke, second])),
+          "the cache must equal a full re-heal")
+    check(np.array_equal(cache.result(dirty, [stroke]), apply_retouch(dirty, [stroke]))
+          and cache.version > v2, "undoing a stroke must restore exactly what it replaced")
+    check(np.array_equal(cache.result(dirty, []), dirty), "undoing everything must give the original")
+
+    # Strokes survive a project file; broken ones are skipped.
+    data = json.loads(json.dumps(strokes_to_data([stroke, second])))
+    check(strokes_from_data(data) == [RetouchStroke([(round(x, 2), round(y, 2)) for x, y in stroke.points],
+                                                    stroke.radius), second],
+          "strokes must round-trip through JSON")
+    check(strokes_from_data([{"points": [], "radius": 3}, {"radius": "x"}, "junk", None]) == [],
+          "malformed strokes must be skipped")
+
+    # The composite heals its background before the Suns go on top.
+    settings = CompositeSettings(retouch=[stroke])
+    camera = SkyCamera(320, 240, 1000.0, 180.0, 10.0, 0.0)
+    out = render_composite(dirty, settings, [], camera)
+    check(float(np.abs(low(out) - low(clean))[area].max()) < 0.012,
+          "the composite must render the retouched background")
+    print(f"   blade removed: residual {ghost.max():.4f} (was {before.max():.4f}), "
+          f"grain ratio {ratio:.2f}, preview vs export {gap:.4f}")
+
+
+def test_retouch_gui(paths):
+    section("9b. Retouch — brush in the main window")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtCore import QCoreApplication, QEventLoop
+    app = QApplication.instance() or QApplication([])
+    check(app is not None, "a QApplication must exist")
+    import gui.main_window as mw
+
+    def pump(timeout_ms: int = 400, until=None) -> bool:
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
+            if until is not None and until():
+                return True
+            time.sleep(0.01)
+        return until() if until is not None else True
+
+    class _Yes:
+        StandardButton = mw.QMessageBox.StandardButton
+
+        @staticmethod
+        def question(*args, **kwargs):
+            return mw.QMessageBox.StandardButton.Yes
+
+    window = mw.MainWindow(session_persistence=False)
+    window.show()
+    window.exposure_list.load_files(paths)
+    window._run_stacking()
+    pump(15000, until=lambda: window._preview_base_bgr is not None)
+    pump(600)
+    container, viewer = window.viewer_container, window.viewer_container.viewer
+    check(window._preview_base_bgr is not None, "the stack must be ready to retouch")
+
+    container.btn_retouch.setChecked(True)
+    check(viewer.retouch_mode() and container.spin_brush.isVisible(),
+          "the retouch button must arm the brush and show its controls")
+    container.btn_roi_toggle.setChecked(True)
+    check(not container.btn_retouch.isChecked() and not viewer.retouch_mode(),
+          "ROI mode and the brush must exclude each other")
+    container.btn_roi_toggle.setChecked(False)
+    pump(4000, until=lambda: window._worker is None or not window._worker.isRunning())
+    pump(400)
+    container.btn_retouch.setChecked(True)
+    container.spin_brush.setValue(14)
+    check(viewer.brush_radius() == 14.0, "the brush size field must drive the brush")
+
+    before = viewer._base_image_rgb.copy()
+    viewer.retouch_stroke.emit([(150.0, 190.0), (250.0, 200.0)], 14.0)
+    pump(200)
+    after = viewer._base_image_rgb.copy()
+    check(len(window._retouch_strokes) == 1
+          and window._retouch_strokes[0].points == [(150.0, 190.0), (250.0, 200.0)],
+          "a painted stroke must be stored in full-resolution pixels")
+    check(not np.array_equal(before, after), "the stroke must heal the preview")
+    window.undo_retouch()
+    pump(200)
+    check(np.array_equal(viewer._base_image_rgb, before), "undo must restore the preview exactly")
+
+    # With a crop, strokes are stored against the uncropped frame.
+    window._crop_rect = (10, 20, 300, 200)
+    viewer.retouch_stroke.emit([(5.0, 6.0)], 4.0)
+    check(window._retouch_strokes[-1].points == [(15.0, 26.0)],
+          f"a stroke on a cropped preview must be offset by the crop ({window._retouch_strokes[-1].points})")
+    window._retouch_strokes.pop()
+    window._crop_rect = None
+    viewer.retouch_stroke.emit([(150.0, 190.0), (250.0, 200.0)], 14.0)
+    pump(200)
+
+    # The strokes are part of the project.
+    project_path = os.path.join(os.path.dirname(paths[0]), "retus.ahdrproj")
+    check(window._write_project(project_path), "a retouched session must save")
+    reopened = mw.MainWindow(session_persistence=False)
+    check(reopened._load_project_file(project_path, remember_path=True)
+          and reopened._retouch_strokes == window._retouch_strokes,
+          "the retouch must come back with the project")
+    reopened.close()
+
+    # The full-resolution export heals the same strokes.
+    def export(path, strokes):
+        worker = mw.FullResExportWorker(window.exposure_list.get_active_items(),
+                                        window.controls.get_settings(), path, export_scale=1.0,
+                                        retouch=strokes)
+        done, errors = [], []
+        worker.finished_success.connect(done.append)
+        worker.failed.connect(errors.append)
+        worker.start()
+        worker.wait(120000)
+        pump(2000, until=lambda: bool(done or errors))
+        check(not errors, f"a retouched export must not fail: {errors}")
+        return imread_unicode(path, cv2.IMREAD_UNCHANGED)
+
+    folder = os.path.dirname(paths[0])
+    plain = export(os.path.join(folder, "bez_retuse.tif"), [])
+    retouched = export(os.path.join(folder, "s_retusi.tif"), window._retouch_strokes)
+    if plain is not None and retouched is not None:
+        # The fusion is multithreaded and may differ in the last bit between
+        # two runs; the retouch itself changes pixels by far more.
+        changed = np.any(np.abs(plain.astype(np.int32) - retouched.astype(np.int32)) > 2, axis=2)
+        ys, xs = np.nonzero(changed)
+        check(changed.any() and xs.min() >= 150 - 40 and xs.max() <= 250 + 40
+              and ys.min() >= 190 - 40 and ys.max() <= 200 + 40,
+              "the export must heal exactly where the stroke was painted")
+
+    original_box = mw.QMessageBox
+    mw.QMessageBox = _Yes
+    try:
+        window.clear_retouch()
+    finally:
+        mw.QMessageBox = original_box
+    check(not window._retouch_strokes, "clearing must remove every stroke")
+    container.btn_retouch.setChecked(False)
+    window.close()
+    print("   brush strokes heal the preview, undo exactly, save with the project and export")
+
+
 def run_all_tests() -> int:
     print("[*] Astro HDR Stacker — comprehensive test suite")
 
@@ -1719,6 +1949,7 @@ def run_all_tests() -> int:
         test_projects(tmpdir, paths)
         test_solar_position()
         scene = test_eclipse_composite(tmpdir)
+        test_retouch()
 
         try:
             test_gui(paths)
@@ -1731,6 +1962,12 @@ def run_all_tests() -> int:
         except Exception:
             traceback.print_exc()
             _FAILURES.append("composite GUI test raised an exception")
+
+        try:
+            test_retouch_gui(paths)
+        except Exception:
+            traceback.print_exc()
+            _FAILURES.append("retouch GUI test raised an exception")
 
     print("\n" + "=" * 64)
     if _FAILURES:

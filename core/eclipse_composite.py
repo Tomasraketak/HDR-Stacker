@@ -41,9 +41,11 @@ import numpy as np
 try:
     from core.solar_position import sun_position, sun_angular_radius_deg, sun_path, ecliptic_horizontal
     from core.postprocess import imread_unicode
+    from core.retouch import RetouchStroke, apply_retouch, strokes_from_data
 except ImportError:  # pragma: no cover
     from .solar_position import sun_position, sun_angular_radius_deg, sun_path, ecliptic_horizontal
     from .postprocess import imread_unicode
+    from .retouch import RetouchStroke, apply_retouch, strokes_from_data
 
 TIME_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
 
@@ -979,6 +981,8 @@ class CompositeSettings:
     target_level: float = 0.85      # surface brightness every Sun is equalised to
     sun_grade: ColorGrade = field(default_factory=ColorGrade)          # master, all Suns
     background_grade: ColorGrade = field(default_factory=ColorGrade)   # the totality frame
+    # Brush strokes healed out of the background (grass, birds), full-res px.
+    retouch: List[RetouchStroke] = field(default_factory=list)
     color_mode: str = "original"
     blend_mode: str = "lighten"
     size_multiplier: float = 1.0
@@ -1008,6 +1012,7 @@ class CompositeSettings:
         settings = cls(**kwargs)
         settings.horizon = _as_tuple(settings.horizon, 4)
         settings.background_grade = ColorGrade.from_dict(data.get("background_grade"))
+        settings.retouch = strokes_from_data(data.get("retouch"))
         settings.sun_grade = ColorGrade.from_dict(data.get("sun_grade"))
         if "sun_grade" not in data:
             # Older projects set the Suns' brightness as a target level only;
@@ -1305,14 +1310,18 @@ def _grade_in_place(img: np.ndarray, grade: ColorGrade, gain: float, pivot: floa
 
 
 def apply_grade(image: np.ndarray, grade: ColorGrade, pivot: float = 0.5,
-                band_rows: int = GRADE_BAND_ROWS) -> np.ndarray:
+                band_rows: int = GRADE_BAND_ROWS, copy: bool = True) -> np.ndarray:
     """
-    A graded float32 copy of a whole BGR image (the totality background).
+    A graded float32 copy of a whole BGR image (the totality background);
+    with copy=False a float32 image is graded in place.
 
     Large images are processed in horizontal bands, so a 45 Mpx export needs
     only the output array plus a band's worth of temporaries.
     """
-    out = np.array(image, dtype=np.float32, copy=True)
+    if copy or image.dtype != np.float32:
+        out = np.array(image, dtype=np.float32, copy=True)
+    else:
+        out = image
     if grade.is_neutral():
         return out
     gain = 2.0 ** grade.exposure
@@ -1415,11 +1424,15 @@ def render_composite(background: np.ndarray, settings: CompositeSettings,
 
     `background` may be a proxy: `scale` is its size relative to the full
     resolution frame that `camera` and all marks are expressed in. The
-    background grade is applied first, unless the caller passes a background
-    it has already graded (the editor caches that between slider moves).
+    background's retouch and grade are applied first — the Suns go on top, so
+    a brush stroke can never erase one — unless the caller passes a background
+    it has already prepared (the editor caches that between slider moves).
     """
     if background_graded:
         out = background.astype(np.float32, copy=True)
+    elif settings.retouch:
+        out = apply_retouch(background, settings.retouch, scale=scale, should_cancel=should_cancel)
+        out = apply_grade(out, settings.background_grade, copy=False)
     else:
         out = apply_grade(background, settings.background_grade)
     placements = compute_placements(settings, camera)

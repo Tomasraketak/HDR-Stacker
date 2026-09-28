@@ -137,7 +137,26 @@ jakmile výběr dokončíte, uvidíte rovnou oříznutý výsledek.
 Ořez se použije **stejně na všechny expozice** — v náhledu i při exportu. Zarovnání
 proběhne ještě před ořezem, takže se u okrajů neztrácí obrazová data.
 
-### 6. Uložte si projekt
+### 6. Retušujte (volitelné) — stébla trávy, ptáci, prach
+Když se do záběru připletla stébla trávy, pták nebo smítko na senzoru, klikněte nad
+náhledem na **`🩹 Retuš`** a přetřete je štětcem. Přetřené místo se doplní okolní oblohou,
+takže to vypadá, jako by tam nikdy nic nebylo:
+- **Světlo oblohy** se dopočítá jako „membrána“ napjatá přes okolí. Plynule tak navazuje
+  na každý přechod, i na zář nad obzorem, a nevznikne šev.
+- **Zrno** (šum) se zkopíruje z čistého místa kousek vedle, aby výplň nebyla podezřele
+  hladká.
+- Štětec má **měkký okraj**: plný kruh u kurzoru je plný účinek, čárkovaný kruh je místo,
+  kde účinek doznívá. Rozostřené stéblo má měkký lem a ten zmizí také.
+
+Ovládání: **levé tlačítko** maluje, **pravé** posouvá pohled, **kolečko** zoomuje,
+klávesy **`[`** a **`]`** zmenšují a zvětšují štětec (velikost jde nastavit i v poli
+vedle tlačítka). **`Ctrl+Z`** vrátí poslední tah, **`🗑`** smaže celou retuš.
+
+Retuš se ukládá do projektu jako tahy štětcem, ne jako obrázek. Při exportu se proto
+provede znovu v plném rozlišení a sedí i po změně ořezu. Funguje nejlépe na obloze
+a jiných hladkých plochách. Na krajině nebo městě by výplň rozmazala detaily.
+
+### 7. Uložte si projekt
 Přes menu **`Projekt → Uložit projekt`** (`Ctrl+S`) si uložte celé rozpracování do
 souboru `.ahdrproj`. Uloží se **všechno**: které fotky jsou načtené, ruční i automatické
 zarovnání každého snímku, které snímky jsou vyřazené, ořez, metoda HDR, zarovnání
@@ -155,12 +174,12 @@ ručně vyvolat přes **`Obnovit poslední relaci`**.
 > **celou složku i s projektem**, funguje dál, protože se ukládají i relativní cesty.
 > Chybějící fotky se jen nahlásí a zbytek projektu se načte.
 
-### 7. Exportujte
+### 8. Exportujte
 **`💾 Exportovat`** (`Ctrl+E`) spočítá výsledek znovu z originálů v plném rozlišení
 a uloží ho jako **16bitový TIFF**, **JPEG**, **16bitový PNG** nebo **32bitový Radiance HDR**.
 Náhled je záměrně zmenšený kvůli rychlosti — na kvalitu exportu to nemá vliv.
 
-### 8. Časosběrný kompozit zatmění (volitelné)
+### 9. Časosběrný kompozit zatmění (volitelné)
 Klasický snímek, kde nad krajinou visí řada Sluncí a Měsíc je postupně „ukusuje“, až nastane
 úplné zatmění, a pak zase odchází. Otevřete ho přes **`🌗 Časosběr zatmění`** v pravém panelu
 nebo **`Nástroje → Časosběrný kompozit zatmění`** (`Ctrl+T`).
@@ -210,11 +229,14 @@ nebo **`Nástroje → Časosběrný kompozit zatmění`** (`Ctrl+T`).
    ztemnění a skvrny, ubráním se disk zploští. Černá zůstává černá, takže Měsíc
    „ukusující“ Slunce nikdy nezešedne. Dvojklik na posuvník ho vrátí na 0,
    **`↺ Vynulovat úpravy`** vynuluje celou záložku.
-6. **Kontrola a doladění** — přes fotku se kreslí **denní dráha Slunce** s časovými
+6. **Retuš pozadí** — stébla trávy nebo ptáky na obloze pozadí přetřete štětcem
+   (**`🩹 Retušovat štětcem`**), stejně jako v hlavním okně (viz bod 6 výše). Slunce se
+   kreslí až na retušované pozadí, takže štětec žádné nesmaže.
+7. **Kontrola a doladění** — přes fotku se kreslí **denní dráha Slunce** s časovými
    značkami, volitelně i **ekliptika**, vyznačený a vypočtený horizont a značky snímků.
    Každé Slunce jde **přetáhnout myší** nebo posunout šipkami (Shift = 5 px, Ctrl = 0,2 px);
    **`↺ Vrátit na vypočtenou polohu`** ruční posun zruší.
-7. **`💾 Exportovat kompozit`** vykreslí výsledek v plném rozlišení (TIFF 16 bit, PNG, JPEG).
+8. **`💾 Exportovat kompozit`** vykreslí výsledek v plném rozlišení (TIFF 16 bit, PNG, JPEG).
 
 Celé nastavení kompozitu se ukládá do projektu `.ahdrproj` spolu s HDR skládáním.
 
@@ -237,6 +259,8 @@ Celé nastavení kompozitu se ukládá do projektu `.ahdrproj` spolu s HDR sklá
 | `Ctrl+M` | Ruční dozarovnání |
 | `Ctrl+T` | Časosběrný kompozit zatmění |
 | `Ctrl+0` / `Ctrl+1` | Přizpůsobit oknu / zobrazit 1:1 |
+| `Ctrl+Z` | Vrátit poslední tah retuše |
+| `[` / `]` | Zmenšit / zvětšit štětec retuše |
 | `Ctrl+Q` | Konec |
 | Kolečko myši | Zoom · dvojklik = přizpůsobit |
 
@@ -292,6 +316,12 @@ výpisu pod tlačítkem *Show Details*) a **běží dál** — rozpracovaná pr�
   saturation, temperature and tint can be graded for all Suns at once, per frame on top of
   that, and for the background. The tone curves pin black, so the Moon never turns grey.
   The Sun's daily path, time ticks and the ecliptic can be overlaid for checking.
+- **Retouch brush** — paint away grass blades, birds or dust from the sky, in the HDR
+  result and in the composite's background. The painted area is refilled with a harmonic
+  (membrane) fill that continues every sky gradient without a seam, plus grain copied from
+  a clean patch nearby; the brush has a soft edge that also removes an out-of-focus
+  object's halo. Strokes are stored as vector paths, so the export re-heals them at full
+  resolution; the preview heals only the new stroke, and undo restores the saved pixels.
 - **Project files** — save the whole session (frames, per-frame alignment, exclusions,
   crop, every setting) to a small JSON `.ahdrproj` and reopen it exactly as it was.
   Paths are stored both absolutely and relative to the project, so moving a folder with
@@ -333,7 +363,9 @@ synthetic sky photographed by a known camera: disc detection on fat, thin and re
 crescents (also tiny ones in a 24 Mpx frame, and overexposed ones with a glow), one solar
 radius across a sequence, camera recovery, placement accuracy, brightness equalisation, the master /
 per-frame / background colour grades, horizon clipping, project round-trips and the editor
-itself.
+itself. The retouch brush is checked on a noisy sky behind a blurred grass blade (no ghost
+left, matching grain, untouched pixels beyond the brush, preview equal to export, exact
+undo) and end to end in both windows, including the full-resolution export.
 
 ## 📋 Requirements
 

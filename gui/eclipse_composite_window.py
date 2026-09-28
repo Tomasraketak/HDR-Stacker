@@ -7,6 +7,9 @@ through the sky at its own timestamp. The user calibrates the background once
 — horizon, Sun, diameter — and the program draws the Sun's daily path (and the
 ecliptic, if wanted) over the photograph so the result can be checked by eye.
 
+Grass blades or birds in the background's sky can be painted away with a
+retouch brush; the Suns are drawn on top of the retouched background.
+
 Every Sun is also equalised to the same surface brightness automatically.
 Brightness, contrast, mid-tones, saturation, temperature and tint can then be
 set for all Suns at once (the master grade), for each frame on top of that,
@@ -29,7 +32,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, QPointF, QRectF, QDate, QTime, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QKeyEvent, QMouseEvent, QCloseEvent
+from PyQt6.QtGui import (QColor, QFont, QPainter, QPainterPath, QPen, QKeyEvent, QMouseEvent,
+                         QCloseEvent, QKeySequence)
 from PyQt6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
     QPushButton, QComboBox, QDoubleSpinBox, QCheckBox, QScrollArea, QFrame,
@@ -51,7 +55,8 @@ try:
                                         extract_focal_length)
     from core.solar_position import sun_position
     from core.postprocess import save_image
-    from gui.image_viewer import InteractiveImageViewer, ACCENT, TEXT_DIM
+    from core.retouch import RetouchStroke, RetouchCache, count_strokes
+    from gui.image_viewer import InteractiveImageViewer, ACCENT, TEXT_DIM, RETOUCH_HINT
     from gui.controls_panel import SliderRow
     from gui.ui_utils import fit_window_to_screen, center_on_screen
 except ImportError:  # pragma: no cover
@@ -67,7 +72,8 @@ except ImportError:  # pragma: no cover
                                           extract_focal_length)
     from ..core.solar_position import sun_position
     from ..core.postprocess import save_image
-    from .image_viewer import InteractiveImageViewer, ACCENT, TEXT_DIM
+    from ..core.retouch import RetouchStroke, RetouchCache, count_strokes
+    from .image_viewer import InteractiveImageViewer, ACCENT, TEXT_DIM, RETOUCH_HINT
     from .controls_panel import SliderRow
     from .ui_utils import fit_window_to_screen, center_on_screen
 
@@ -279,6 +285,10 @@ class CompositeCanvas(InteractiveImageViewer):
     # ---------------------------------------------------------------- Mouse
 
     def mousePressEvent(self, event: QMouseEvent):
+        if self._retouch_enabled:
+            # The brush owns the left button; markers stay put while retouching.
+            super().mousePressEvent(event)
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._base_pixmap is not None:
             scene = self._to_scene(event.position())
             if self._tool in (self.TOOL_HORIZON, self.TOOL_SUN):
@@ -338,6 +348,8 @@ class CompositeCanvas(InteractiveImageViewer):
         }
         text = hints.get(self._tool,
                          "Tažením Slunce ho posunete · šipky = jemný posun · kolečko = zoom")
+        if self._retouch_enabled:
+            text = RETOUCH_HINT + " · Ctrl+Z zpět"
         text = f"Zoom {int(self._zoom * 100)} %   ·   {text}"
         painter.setFont(QFont("Segoe UI", 9))
         metrics = painter.fontMetrics()
@@ -346,7 +358,7 @@ class CompositeCanvas(InteractiveImageViewer):
         path = QPainterPath()
         path.addRoundedRect(rect, rect.height() / 2.0, rect.height() / 2.0)
         painter.fillPath(path, QColor(8, 10, 16, 200))
-        painter.setPen(ACCENT if self._tool != self.TOOL_NONE else TEXT_DIM)
+        painter.setPen(ACCENT if self._tool != self.TOOL_NONE or self._retouch_enabled else TEXT_DIM)
         painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
     def _polyline(self, painter: QPainter, points, pen: QPen):
@@ -690,8 +702,9 @@ class EclipseCompositeWindow(QDialog):
 
         self.settings = settings
         self._bg_proxy: Optional[np.ndarray] = None
-        self._bg_graded: Optional[np.ndarray] = None    # _bg_proxy with the background grade
+        self._bg_graded: Optional[np.ndarray] = None    # _bg_proxy retouched and graded
         self._bg_graded_key: Optional[tuple] = None
+        self._retouch_cache = RetouchCache()
         self._bg_scale = 1.0
         self._bg_size = (0, 0)
         self._cutouts: Dict[str, Optional[SunCutout]] = {}
@@ -741,6 +754,7 @@ class EclipseCompositeWindow(QDialog):
         layout.addWidget(self._build_selected_group())
         layout.addWidget(self._build_look_group())
         layout.addWidget(self._build_grade_group())
+        layout.addWidget(self._build_retouch_group())
         layout.addWidget(self._build_overlay_group())
         layout.addStretch()
         # Long option texts must not dictate the panel width; the popup list
@@ -1104,8 +1118,42 @@ class EclipseCompositeWindow(QDialog):
         layout.addWidget(self.grade_tabs)
         return group
 
+    def _build_retouch_group(self) -> QGroupBox:
+        group = QGroupBox("6 · Retuš pozadí (stébla, ptáci…)")
+        layout = QVBoxLayout(group)
+        hint = QLabel("Přetřete stéblo trávy nebo jiný předmět na obloze: zmizí a doplní se "
+                      "okolní obloha i se zrnem. Štětec má měkký okraj (čárkovaný kruh). "
+                      "Slunce se kreslí až na retušované pozadí.")
+        hint.setObjectName("StatusHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.btn_retouch = QPushButton("🩹  Retušovat štětcem")
+        self.btn_retouch.setCheckable(True)
+        self.btn_retouch.setToolTip("Levé tlačítko maluje, pravé posouvá pohled,\n"
+                                    "[ a ] mění velikost štětce, Ctrl+Z vrátí tah.")
+        self.btn_retouch.toggled.connect(self._on_retouch_toggled)
+        layout.addWidget(self.btn_retouch)
+        self.slider_brush = SliderRow("Velikost štětce", 1.0, 200.0, 12.0, step=1.0, suffix=" px",
+                                      tip="Poloměr štětce v pixelech plného rozlišení pozadí.",
+                                      decimals=0)
+        self.slider_brush.valueChanged.connect(lambda v: self.canvas.set_brush_radius(v))
+        layout.addWidget(self.slider_brush)
+        row = QHBoxLayout()
+        self.btn_retouch_undo = QPushButton("↶  Zpět")
+        self.btn_retouch_undo.setToolTip("Vrátit poslední tah (Ctrl+Z)")
+        self.btn_retouch_undo.clicked.connect(self.undo_retouch)
+        row.addWidget(self.btn_retouch_undo, 1)
+        self.btn_retouch_clear = QPushButton("🗑  Smazat vše")
+        self.btn_retouch_clear.clicked.connect(self.clear_retouch)
+        row.addWidget(self.btn_retouch_clear, 1)
+        layout.addLayout(row)
+        self.lbl_retouch = QLabel("")
+        self.lbl_retouch.setObjectName("StatusHint")
+        layout.addWidget(self.lbl_retouch)
+        return group
+
     def _build_overlay_group(self) -> QGroupBox:
-        group = QGroupBox("5 · Pomocné čáry (jen v náhledu)")
+        group = QGroupBox("7 · Pomocné čáry (jen v náhledu)")
         grid = QGridLayout(group)
         self.chk_path = QCheckBox("Denní dráha Slunce")
         self.chk_ticks = QCheckBox("Časové značky po")
@@ -1159,6 +1207,9 @@ class EclipseCompositeWindow(QDialog):
         self.canvas.sun_marked.connect(self._on_sun_marked)
         self.canvas.frame_clicked.connect(self._select_frame)
         self.canvas.frame_moved.connect(self._on_frame_dragged)
+        self.canvas.retouch_stroke.connect(self._on_retouch_stroke)
+        self.canvas.brush_radius_changed.connect(lambda r: _set_quiet(self.slider_brush, r))
+        self.canvas.set_brush_radius(12.0)
         layout.addWidget(self.canvas, 1)
         return container
 
@@ -1206,6 +1257,7 @@ class EclipseCompositeWindow(QDialog):
         finally:
             self._syncing = False
         self._update_clock_hint()
+        self._update_retouch_label()
         self._rebuild_table()
         self._load_selected_into_editor()
 
@@ -1773,6 +1825,9 @@ class EclipseCompositeWindow(QDialog):
         self._schedule_render()
 
     def keyPressEvent(self, event: QKeyEvent):
+        if event.matches(QKeySequence.StandardKey.Undo):
+            self.undo_retouch()
+            return
         step = 1.0
         if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
             step = 5.0
@@ -1819,15 +1874,66 @@ class EclipseCompositeWindow(QDialog):
         self._schedule_render()
 
     def _graded_background(self) -> Optional[np.ndarray]:
-        """The preview background with its grade, re-graded only when that changes."""
+        """
+        The preview background retouched and graded. Each stage is redone only
+        when its own input changes: a new brush stroke heals just its own
+        neighbourhood, a grade change never re-heals anything.
+        """
         if self._bg_proxy is None:
             return None
+        healed = self._retouch_cache.result(self._bg_proxy, self.settings.retouch,
+                                            scale=self._bg_scale)
         grade = self.settings.background_grade
-        key = astuple(grade)
+        key = (self._retouch_cache.version,) + astuple(grade)
         if self._bg_graded is None or self._bg_graded_key != key:
-            self._bg_graded = apply_grade(self._bg_proxy, grade)
+            self._bg_graded = apply_grade(healed, grade)
             self._bg_graded_key = key
         return self._bg_graded
+
+    # ============================================================ Retouch
+
+    def _on_retouch_toggled(self, on: bool):
+        if on:
+            self.btn_tool_horizon.setChecked(False)
+            self.btn_tool_sun.setChecked(False)
+            self.canvas.set_brush_radius(self.slider_brush.value())
+            self.lbl_status.setText("🩹 Retuš: přetřete stéblo nebo jiný předmět na obloze. "
+                                    "Pravým tlačítkem posun, [ ] velikost štětce, Ctrl+Z zpět.")
+        self.canvas.set_retouch_mode(on)
+        self.canvas.setFocus()
+
+    def _on_retouch_stroke(self, points, radius: float):
+        if self._bg_proxy is None:
+            return
+        # The canvas works in full-resolution background pixels already.
+        self.settings.retouch.append(
+            RetouchStroke([(float(x), float(y)) for x, y in points], float(radius)))
+        self._update_retouch_label()
+        self._refresh()
+
+    def undo_retouch(self):
+        if not self.settings.retouch:
+            return
+        self.settings.retouch.pop()
+        self._update_retouch_label()
+        self._schedule_render()
+
+    def clear_retouch(self):
+        if not self.settings.retouch:
+            return
+        reply = QMessageBox.question(self, "Smazat retuš",
+                                     f"Smazat celou retuš pozadí ({count_strokes(len(self.settings.retouch))})?",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                     QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.settings.retouch.clear()
+        self._update_retouch_label()
+        self._schedule_render()
+
+    def _update_retouch_label(self):
+        count = len(self.settings.retouch)
+        self.lbl_retouch.setText(f"Retuš: {count_strokes(count)}" if count else "Zatím bez retuše.")
 
     # ============================================================== Look
 
