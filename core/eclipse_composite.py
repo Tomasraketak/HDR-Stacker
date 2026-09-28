@@ -717,6 +717,50 @@ def solve_camera(cal: Calibration, sun_az: float, sun_alt: float, sun_radius_deg
 # ------------------------------------------------------------ Settings model
 
 @dataclass
+class ColorGrade:
+    """
+    Photo-editor style adjustments. Every value is 0 when neutral, so two
+    grades simply add up: the master grade of all Suns plus one frame's own.
+    """
+    exposure: float = 0.0       # EV
+    contrast: float = 0.0       # -100 .. 100, around the subject's own mid level
+    midtones: float = 0.0       # -100 .. 100, black and white stay where they are
+    saturation: float = 0.0     # -100 (greyscale) .. 100
+    temperature: float = 0.0    # -100 (cooler) .. 100 (warmer)
+    tint: float = 0.0           # -100 (greener) .. 100 (more magenta)
+
+    def is_neutral(self) -> bool:
+        return all(abs(getattr(self, name)) < 1e-6 for name in GRADE_LIMITS)
+
+    def combined(self, other: "ColorGrade") -> "ColorGrade":
+        """This grade with `other` added on top, each value kept in range."""
+        return ColorGrade(**{name: min(hi, max(lo, getattr(self, name) + getattr(other, name)))
+                             for name, (lo, hi) in GRADE_LIMITS.items()})
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "ColorGrade":
+        grade = cls()
+        if isinstance(data, dict):
+            for name, (lo, hi) in GRADE_LIMITS.items():
+                try:
+                    setattr(grade, name, min(hi, max(lo, float(data.get(name, 0.0)))))
+                except (TypeError, ValueError):
+                    pass
+        return grade
+
+
+# name -> (lowest, highest) value of each adjustment.
+GRADE_LIMITS = {
+    "exposure": (-6.0, 6.0),
+    "contrast": (-100.0, 100.0),
+    "midtones": (-100.0, 100.0),
+    "saturation": (-100.0, 100.0),
+    "temperature": (-100.0, 100.0),
+    "tint": (-100.0, 100.0),
+}
+
+
+@dataclass
 class PartialFrame:
     """One filtered partial-phase photograph and every decision made about it."""
     path: str
@@ -726,7 +770,7 @@ class PartialFrame:
     enabled: bool = True
     disc: Optional[Tuple[float, float, float]] = None   # full-res, in its own frame
     auto_brightness: bool = True
-    ev_adjust: float = 0.0          # user correction on top of the automatic gain
+    grade: ColorGrade = field(default_factory=ColorGrade)   # on top of the master grade
     offset_x: float = 0.0           # manual nudge, background full-res pixels
     offset_y: float = 0.0
     rotation: float = 0.0           # extra rotation, degrees clockwise
@@ -753,7 +797,9 @@ class CompositeSettings:
     horizon_altitude: float = 0.0
     scale_mode: str = "auto"
     clock_offset_s: float = 0.0     # added to every partial frame's timestamp
-    target_level: float = 0.85
+    target_level: float = 0.85      # surface brightness every Sun is equalised to
+    sun_grade: ColorGrade = field(default_factory=ColorGrade)          # master, all Suns
+    background_grade: ColorGrade = field(default_factory=ColorGrade)   # the totality frame
     color_mode: str = "original"
     blend_mode: str = "lighten"
     size_multiplier: float = 1.0
@@ -782,11 +828,27 @@ class CompositeSettings:
         kwargs = {k: v for k, v in data.items() if k in allowed}
         settings = cls(**kwargs)
         settings.horizon = _as_tuple(settings.horizon, 4)
+        settings.background_grade = ColorGrade.from_dict(data.get("background_grade"))
+        settings.sun_grade = ColorGrade.from_dict(data.get("sun_grade"))
+        if "sun_grade" not in data:
+            # Older projects set the Suns' brightness as a target level only;
+            # the master exposure now carries it.
+            try:
+                level = float(settings.target_level)
+            except (TypeError, ValueError):
+                level = 0.0
+            if level > 0:
+                settings.sun_grade.exposure = round(math.log2(level / 0.85), 3)
+            settings.target_level = 0.85
         frame_keys = {f.name for f in fields(PartialFrame)}
         for raw in data.get("frames") or []:
             if isinstance(raw, dict) and raw.get("path"):
                 frame = PartialFrame(**{k: v for k, v in raw.items() if k in frame_keys})
                 frame.disc = _as_tuple(frame.disc, 3)
+                frame.grade = ColorGrade.from_dict(raw.get("grade"))
+                if "grade" not in raw and "ev_adjust" in raw:
+                    # Older projects: the per-frame EV correction.
+                    frame.grade = ColorGrade.from_dict({"exposure": raw.get("ev_adjust")})
                 settings.frames.append(frame)
         if settings.blend_mode not in BLEND_MODES:
             settings.blend_mode = "lighten"
@@ -963,9 +1025,85 @@ def frame_gains(settings: CompositeSettings, cutouts: Sequence[Optional[SunCutou
     for frame, cut in zip(settings.frames, cutouts):
         level = cut.level if cut is not None else 1.0
         base = settings.target_level / level if frame.auto_brightness else 1.0
-        gain = float(base * (2.0 ** float(frame.ev_adjust)))
+        exposure = settings.sun_grade.combined(frame.grade).exposure
+        gain = float(base * (2.0 ** exposure))
         gains.append((gain, None if target is None else target.astype(np.float32)))
     return gains
+
+
+# Luma weights (BGR), as in the main post-processing.
+_LUMA_BGR = np.array([0.114, 0.587, 0.299], np.float32)
+
+# Rows per band when grading a large image, to bound the temporaries.
+GRADE_BAND_ROWS = 512
+
+
+def white_balance_gains(temperature: float, tint: float) -> np.ndarray:
+    """
+    BGR channel multipliers for a temperature / tint shift (-100 .. 100),
+    normalised so that the luma of a grey pixel is unchanged.
+    """
+    t, g = float(temperature) / 100.0, float(tint) / 100.0
+    gains = np.array([2.0 ** (-0.5 * t + 0.15 * g),     # blue
+                      2.0 ** (-0.3 * g),                # green
+                      2.0 ** (0.5 * t + 0.15 * g)],     # red
+                     np.float32)
+    return gains / float(np.dot(_LUMA_BGR, gains))
+
+
+def _grade_in_place(img: np.ndarray, grade: ColorGrade, gain: float, pivot: float):
+    """
+    Grades float32 BGR pixels in place: white balance and `gain` (which already
+    includes the exposure), then contrast, mid-tones and saturation.
+
+    The tone curves keep black at black and white at white, and their slope
+    stays finite at zero: the black sky around a cut-out Sun, and the Moon
+    biting into it, must never turn grey — with the lighten blend a grey Moon
+    would show as a pale disc over the landscape.
+    """
+    wb = white_balance_gains(grade.temperature, grade.tint) * float(gain)
+    img *= wb.reshape(1, 1, 3)
+    np.clip(img, 0.0, 1.0, out=img)
+
+    # Contrast: piecewise quadratic through (0, 0), (pivot, pivot) and (1, 1)
+    # with slope c at the pivot; monotonic for c in [0, 2].
+    c = 1.0 + min(100.0, max(-100.0, grade.contrast)) / 100.0
+    if abs(c - 1.0) > 1e-4:
+        p = min(0.9, max(0.1, float(pivot)))
+        weight = np.where(img < p, img / p, (1.0 - img) / (1.0 - p))
+        weight *= img - p
+        img += (c - 1.0) * weight
+
+    # Mid-tones: y = x + a x (1 - x) lifts or lowers the middle only.
+    a = min(100.0, max(-100.0, grade.midtones)) / 100.0
+    if abs(a) > 1e-4:
+        img += a * img * (1.0 - img)
+
+    s = 1.0 + min(100.0, max(-100.0, grade.saturation)) / 100.0
+    if abs(s - 1.0) > 1e-4:
+        luma = img @ _LUMA_BGR
+        img -= luma[:, :, None]
+        img *= s
+        img += luma[:, :, None]
+    np.clip(img, 0.0, 1.0, out=img)
+
+
+def apply_grade(image: np.ndarray, grade: ColorGrade, pivot: float = 0.5,
+                band_rows: int = GRADE_BAND_ROWS) -> np.ndarray:
+    """
+    A graded float32 copy of a whole BGR image (the totality background).
+
+    Large images are processed in horizontal bands, so a 45 Mpx export needs
+    only the output array plus a band's worth of temporaries.
+    """
+    out = np.array(image, dtype=np.float32, copy=True)
+    if grade.is_neutral():
+        return out
+    gain = 2.0 ** grade.exposure
+    step = max(1, int(band_rows))
+    for y0 in range(0, out.shape[0], step):
+        _grade_in_place(out[y0:y0 + step], grade, gain, pivot)
+    return out
 
 
 # ------------------------------------------------------------- Rendering
@@ -981,8 +1119,14 @@ def _horizon_sky_sign(settings: CompositeSettings) -> float:
 
 
 def _render_one(out: np.ndarray, cut: SunCutout, place: Placement,
-                gain: Tuple[float, Optional[np.ndarray]], settings: CompositeSettings, scale: float, sky_sign: float):
-    """Warps one cut-out Sun into `out` (float32 BGR, modified in place)."""
+                gain: Tuple[float, Optional[np.ndarray]], grade: ColorGrade,
+                settings: CompositeSettings, scale: float, sky_sign: float):
+    """
+    Warps one cut-out Sun into `out` (float32 BGR, modified in place).
+
+    `gain` already carries the grade's exposure; the rest of `grade` (the
+    master grade plus this frame's own) is applied here.
+    """
     h, w = out.shape[:2]
     X, Y = place.x * scale, place.y * scale
     radius = place.radius * scale
@@ -1017,8 +1161,9 @@ def _render_one(out: np.ndarray, cut: SunCutout, place: Placement,
     factor, chroma = gain
     if chroma is not None:
         patch = _brightness(patch)[:, :, None] * chroma.reshape(1, 1, 3)
-    patch *= factor
-    np.clip(patch, 0.0, 1.0, out=patch)
+    # Contrast pivots on the Sun's own surface level, so it deepens the limb
+    # darkening and sunspots instead of just brightening the whole disc.
+    _grade_in_place(patch, grade, factor, pivot=cut.level * factor)
 
     yy, xx = np.mgrid[oy:oy + size, ox:ox + size].astype(np.float32)
     dist = np.hypot(xx - X, yy - Y)
@@ -1047,14 +1192,20 @@ def _render_one(out: np.ndarray, cut: SunCutout, place: Placement,
 def render_composite(background: np.ndarray, settings: CompositeSettings,
                      cutouts: Sequence[Optional[SunCutout]], camera: SkyCamera,
                      scale: float = 1.0,
-                     should_cancel: Optional[Callable[[], bool]] = None) -> np.ndarray:
+                     should_cancel: Optional[Callable[[], bool]] = None,
+                     background_graded: bool = False) -> np.ndarray:
     """
     Paints every enabled partial Sun onto a copy of the background.
 
     `background` may be a proxy: `scale` is its size relative to the full
-    resolution frame that `camera` and all marks are expressed in.
+    resolution frame that `camera` and all marks are expressed in. The
+    background grade is applied first, unless the caller passes a background
+    it has already graded (the editor caches that between slider moves).
     """
-    out = background.astype(np.float32, copy=True)
+    if background_graded:
+        out = background.astype(np.float32, copy=True)
+    else:
+        out = apply_grade(background, settings.background_grade)
     placements = compute_placements(settings, camera)
     gains = frame_gains(settings, cutouts)
     sky_sign = _horizon_sky_sign(settings) if settings.horizon is not None else 1.0
@@ -1067,5 +1218,6 @@ def render_composite(background: np.ndarray, settings: CompositeSettings,
         cut = cutouts[place.index] if place.index < len(cutouts) else None
         if cut is None:
             continue
-        _render_one(out, cut, place, gains[place.index], settings, scale, sky_sign)
+        grade = settings.sun_grade.combined(settings.frames[place.index].grade)
+        _render_one(out, cut, place, gains[place.index], grade, settings, scale, sky_sign)
     return np.clip(out, 0.0, 1.0)

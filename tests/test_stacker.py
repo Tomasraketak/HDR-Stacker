@@ -49,6 +49,7 @@ from core.eclipse_composite import (
     SkyCamera, Calibration, CompositeSettings, CompositeError, PartialFrame, solve_camera,
     calibrate, compute_placements, detect_sun_disc, detect_totality_disc, cut_out_sun,
     load_image_float, render_composite, frame_gains, path_polyline, format_time,
+    ColorGrade, apply_grade,
 )
 from core.solar_position import _solar_coordinates
 from datetime import datetime, timedelta
@@ -729,6 +730,97 @@ def test_solar_position():
     print(f"   Meeus examples reproduced; León totality Sun at az {az_s:.2f}, alt {alt_s:.2f}")
 
 
+def _check_grades(bg, settings, cutouts, camera, placements, reference):
+    """Colour grading: the pixel maths, and the master / per-frame / background layers."""
+    ramp = np.linspace(0.0, 1.0, 101, dtype=np.float32)
+    grey = np.repeat(ramp[None, :, None], 3, axis=2)
+    colour = np.dstack([ramp * 0.3, ramp * 0.6, ramp]).astype(np.float32)
+
+    check(np.array_equal(apply_grade(colour, ColorGrade()), colour),
+          "a neutral grade must leave the image untouched")
+    warm = apply_grade(grey, ColorGrade(temperature=60.0))
+    luma = warm @ np.array([0.114, 0.587, 0.299], np.float32)
+    check(float(warm[0, 40, 2]) > float(warm[0, 40, 0]) * 1.4
+          and float(np.abs(luma[0, :80] - ramp[:80]).max()) < 0.01,
+          "a warmer temperature must shift grey towards red at the same brightness")
+    magenta = apply_grade(grey, ColorGrade(tint=60.0))
+    check(float(magenta[0, 50, 1]) < float(magenta[0, 50, 2]) * 0.9,
+          "a magenta tint must lower green")
+    mono = apply_grade(colour, ColorGrade(saturation=-100.0))
+    check(float(np.ptp(mono, axis=2).max()) < 1e-5, "saturation -100 must be greyscale")
+    vivid = apply_grade(colour, ColorGrade(saturation=50.0))
+    check(float(np.ptp(vivid[0, 50])) > float(np.ptp(colour[0, 50])) * 1.3,
+          "more saturation must spread the channels")
+    punchy = apply_grade(grey, ColorGrade(contrast=60.0))
+    check(punchy[0, 0, 0] == 0.0 and abs(float(punchy[0, 100, 0]) - 1.0) < 1e-6
+          and abs(float(punchy[0, 50, 0]) - 0.5) < 1e-6
+          and punchy[0, 25, 0] < 0.25 and punchy[0, 75, 0] > 0.75
+          and bool(np.all(np.diff(punchy[0, :, 0]) >= -1e-7)),
+          "contrast must keep black, white and the pivot, and stay monotonic")
+    lifted = apply_grade(grey, ColorGrade(midtones=60.0))
+    check(lifted[0, 0, 0] == 0.0 and abs(float(lifted[0, 100, 0]) - 1.0) < 1e-6
+          and abs(float(lifted[0, 50, 0]) - 0.65) < 1e-5,
+          "mid-tones must move the middle only")
+    brighter = apply_grade(grey, ColorGrade(exposure=1.0))
+    check(abs(float(brighter[0, 20, 0]) - 0.4) < 1e-5 and float(brighter.max()) <= 1.0,
+          "+1 EV must double the brightness, clipped at white")
+    # The black sky around a cut-out Sun, and the Moon, must never turn grey:
+    # black stays exactly black, and the curves' slope at black is bounded
+    # (a plain gamma of 2 would lift 0.01 to 0.1 on its own).
+    extreme = ColorGrade(contrast=-100.0, midtones=100.0, saturation=100.0, temperature=100.0)
+    check(float(apply_grade(np.zeros((4, 4, 3), np.float32), extreme).max()) == 0.0
+          and float(apply_grade(np.full((4, 4, 3), 0.01, np.float32), extreme).max()) < 0.08,
+          "black must stay black under any grade")
+    big = np.random.default_rng(3).random((37, 23, 3), dtype=np.float32)
+    mixed = ColorGrade(exposure=0.4, contrast=35.0, midtones=-20.0, saturation=30.0,
+                       temperature=-25.0, tint=15.0)
+    check(np.allclose(apply_grade(big, mixed, band_rows=5), apply_grade(big, mixed, band_rows=4096),
+                      atol=1e-6),
+          "grading in bands must equal grading in one piece")
+
+    # Master exposure and a frame's own exposure add up.
+    base = [g for g, _c in frame_gains(settings, cutouts)]
+    settings.sun_grade.exposure = 1.0
+    settings.frames[0].grade.exposure = -1.0
+    both = [g for g, _c in frame_gains(settings, cutouts)]
+    check(abs(both[0] - base[0]) < 1e-6 and abs(both[1] - 2.0 * base[1]) < 1e-6,
+          "the master and per-frame exposure must add up")
+    settings.sun_grade.exposure = 0.0
+    settings.frames[0].grade.exposure = 0.0
+
+    # Master temperature warms every Sun; one frame can cancel it for itself.
+    settings.sun_grade.temperature = 80.0
+    settings.frames[1].grade.temperature = -80.0
+    toned = render_composite(bg, settings, cutouts, camera)
+    ratios = []
+    for place in placements:
+        r = place.radius
+        box = toned[int(place.y - r):int(place.y + r) + 1, int(place.x - r):int(place.x + r) + 1]
+        lit = box.max(axis=2) > 0.3
+        ratios.append(float(box[..., 2][lit].mean() / max(1e-6, box[..., 0][lit].mean())))
+    check(ratios[0] > 1.5 and ratios[2] > 1.5 and abs(ratios[1] - 1.0) < 0.1,
+          f"the master grade must warm every Sun except the one that cancels it ({ratios})")
+    settings.sun_grade = ColorGrade()
+    settings.frames[1].grade = ColorGrade()
+
+    # The background has its own grade, which leaves the Suns alone.
+    settings.background_grade.exposure = -1.0
+    darker = render_composite(bg, settings, cutouts, camera)
+    corner = (slice(0, 40), slice(0, 40))
+    check(np.allclose(darker[corner], reference[corner] * 0.5, atol=2e-3),
+          "the background grade must darken the background")
+    p1 = placements[1]
+    sun_box = (slice(int(p1.y - 3), int(p1.y + 4)), slice(int(p1.x - 3), int(p1.x + 4)))
+    check(abs(float(darker[sun_box].max()) - float(reference[sun_box].max())) < 0.02,
+          "the background grade must not touch the Suns")
+    pre = apply_grade(bg, settings.background_grade)
+    check(np.allclose(render_composite(pre, settings, cutouts, camera, background_graded=True),
+                      darker, atol=1e-6),
+          "a pre-graded background must render the same picture")
+    settings.background_grade = ColorGrade()
+    print(f"   grades: master/per-frame R:B ratios {', '.join(f'{v:.2f}' for v in ratios)}")
+
+
 def test_eclipse_composite(tmpdir):
     section("8b. Eclipse sequence composite — calibration, placement, brightness")
     scene = _composite_scene(tmpdir)
@@ -826,14 +918,16 @@ def test_eclipse_composite(tmpdir):
           "the dimmest frame must receive the largest automatic gain")
 
     # A manual EV correction brightens only that Sun.
-    settings.frames[2].ev_adjust = -1.0
+    settings.frames[2].grade.exposure = -1.0
     dimmer = render_composite(bg, settings, cutouts, report.camera)
     p2 = placements[2]
     region = (slice(int(p2.y - p2.radius), int(p2.y + p2.radius) + 1),
               slice(int(p2.x - p2.radius), int(p2.x + p2.radius) + 1))
     check(float(dimmer[region].max()) < float(out[region].max()) * 0.7,
           "a -1 EV correction must darken that Sun")
-    settings.frames[2].ev_adjust = 0.0
+    settings.frames[2].grade.exposure = 0.0
+
+    _check_grades(bg, settings, cutouts, report.camera, placements, out)
 
     # A Sun below the horizon must not be painted over the landscape.
     below = CompositeSettings.from_dict(settings.to_dict())
@@ -869,11 +963,29 @@ def test_eclipse_composite(tmpdir):
     check(float(small_patch.max()) > 0.6,
           "the proxy preview must show the Sun at the scaled position")
 
-    # Settings survive a dict round-trip, including tuples.
+    # Settings survive a dict round-trip, including tuples and grades.
+    settings.sun_grade.saturation = 25.0
+    settings.background_grade.contrast = -10.0
+    settings.frames[1].grade.temperature = -30.0
     again = CompositeSettings.from_dict(json.loads(json.dumps(settings.to_dict())))
     check(again.horizon == tuple(settings.horizon) and len(again.frames) == 3
           and again.frames[0].disc == tuple(settings.frames[0].disc),
           "composite settings must round-trip through JSON")
+    check(again.sun_grade == settings.sun_grade and again.background_grade == settings.background_grade
+          and again.frames[1].grade == settings.frames[1].grade,
+          "master, background and per-frame grades must round-trip through JSON")
+    settings.sun_grade = ColorGrade()
+    settings.background_grade = ColorGrade()
+    settings.frames[1].grade = ColorGrade()
+    # Projects from before the grades: target level and per-frame EV carry over.
+    old = CompositeSettings.from_dict({"target_level": 0.425,
+                                       "frames": [{"path": "x.jpg", "ev_adjust": 0.5}]})
+    check(abs(old.sun_grade.exposure + 1.0) < 1e-6 and abs(old.target_level - 0.85) < 1e-9
+          and abs(old.frames[0].grade.exposure - 0.5) < 1e-6,
+          f"an older project's brightness settings must migrate ({old.sun_grade}, "
+          f"{old.frames[0].grade})")
+    check(ColorGrade.from_dict({"contrast": 900, "tint": "x"}) == ColorGrade(contrast=100.0),
+          "grade values must be clamped and bad ones ignored")
     check(CompositeSettings.from_dict({"blend_mode": "bogus", "frames": [{"path": "x",
                                                                           "future": 1}]}
                                       ).blend_mode == "lighten",
@@ -996,9 +1108,34 @@ def test_composite_gui(tmpdir, scene):
         check(s.frames[1].offset_x == 0.0 and s.frames[1].offset_y == 0.0,
               "the reset must return the Sun to its computed place")
 
-        # Per-frame EV and the global look controls feed the settings.
-        editor.slider_ev.setValue(0.5)
-        check(abs(s.frames[1].ev_adjust - 0.5) < 1e-6, "the EV slider must edit the selected frame")
+        # Per-frame, master and background grades, and the look controls.
+        editor.grade_frame.rows["exposure"].setValue(0.5)
+        editor.grade_frame.rows["temperature"].setValue(30.0)
+        check(abs(s.frames[1].grade.exposure - 0.5) < 1e-6
+              and s.frames[1].grade.temperature == 30.0 and s.frames[0].grade.temperature == 0.0,
+              "the per-frame sliders must edit the selected frame only")
+        editor._select_frame(0)
+        check(editor.grade_frame.rows["temperature"].value() == 0.0,
+              "selecting another frame must show that frame's own grade")
+        editor._select_frame(1)
+        check(editor.grade_frame.rows["temperature"].value() == 30.0,
+              "selecting a frame again must show its grade")
+        editor.grade_master.rows["saturation"].setValue(-40.0)
+        editor.grade_master.rows["contrast"].setValue(20.0)
+        check(s.sun_grade.saturation == -40.0 and s.sun_grade.contrast == 20.0,
+              "the master sliders must edit the grade of all Suns")
+        proxy_mean = float(editor._bg_proxy.mean())
+        editor.grade_background.rows["exposure"].setValue(-1.0)
+        pump(300)
+        check(s.background_grade.exposure == -1.0 and editor._bg_graded is not None
+              and abs(float(editor._bg_graded.mean()) - proxy_mean * 0.5) < 0.01,
+              "the background grade must be applied to the preview")
+        cached = editor._bg_graded
+        editor.grade_master.rows["tint"].setValue(10.0)
+        pump(300)
+        check(editor._bg_graded is cached, "a Sun-only change must not re-grade the background")
+        editor.grade_background.reset()
+        check(s.background_grade == ColorGrade(), "the reset must clear the background grade")
         editor.combo_blend.setCurrentIndex(editor.combo_blend.findData("normal"))
         check(s.blend_mode == "normal", "the blend mode must be applied")
         editor.chk_ecliptic.setChecked(True)
@@ -1023,8 +1160,9 @@ def test_composite_gui(tmpdir, scene):
               "a composite-only project must open")
         check(len(window._composite_settings.frames) == 3
               and window._composite_settings.horizon is not None
-              and abs(window._composite_settings.frames[1].ev_adjust - 0.5) < 1e-6,
-              "the composite must be restored from the project")
+              and abs(window._composite_settings.frames[1].grade.exposure - 0.5) < 1e-6
+              and window._composite_settings.sun_grade.saturation == -40.0,
+              "the composite must be restored from the project, grades included")
 
         window.open_eclipse_composite()
         reopened = window._composite_window

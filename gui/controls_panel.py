@@ -26,12 +26,14 @@ class SliderRow(QWidget):
     valueChanged = pyqtSignal(float)
 
     def __init__(self, label: str, min_val: float, max_val: float, default_val: float,
-                 step: float = 0.05, suffix: str = "", tip: str = "", parent=None):
+                 step: float = 0.05, suffix: str = "", tip: str = "", parent=None,
+                 decimals: int = 2):
         super().__init__(parent)
         self.min_val = min_val
         self.max_val = max_val
         self.step = step
         self.suffix = suffix
+        self.decimals = max(0, int(decimals))
         self.default_val = default_val
         # Integer slider positions map onto float values through this multiplier.
         self.multiplier = max(1, int(round(1.0 / step)))
@@ -63,7 +65,7 @@ class SliderRow(QWidget):
             self.lbl_title.setToolTip(tip)
 
     def _format(self, val: float) -> str:
-        return f"{val:.2f}{self.suffix}"
+        return f"{val:.{self.decimals}f}{self.suffix}"
 
     def _on_slider_changed(self, val: int):
         float_val = val / float(self.multiplier)

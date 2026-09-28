@@ -6,36 +6,74 @@ diamond ring — as well as ordinary landscape HDR.
 
 ---
 
-## 🚀 Rychlý start (Windows 10 / 11)
+## 🚀 Instalace, aktualizace a spuštění
 
-**Nejrychlejší cesta — stačí dvakrát kliknout:**
+Potřebujete **Python 3.10 – 3.12** z [python.org](https://www.python.org/downloads/)
+(na Windows při instalaci **zaškrtněte „Add Python to PATH“**) a **Git**
+z [git-scm.com](https://git-scm.com/downloads).
 
-1. Nainstalujte **Python 3.10 – 3.12** z [python.org](https://www.python.org/downloads/windows/).
-   Při instalaci **zaškrtněte „Add Python to PATH“**.
-2. Ve složce s programem poklepejte na **`run.bat`**.
+### Windows (Příkazový řádek i PowerShell)
 
-`run.bat` při prvním spuštění sám vytvoří virtuální prostředí, doinstaluje knihovny
-a spustí aplikaci. Při dalších spuštěních už jen spustí aplikaci (během pár sekund).
+**Instalace** — jen poprvé:
 
-**Ruční cesta (PowerShell nebo Příkazový řádek):**
-
-```powershell
-cd C:\cesta\k\HDR-Stacker
+```bat
+git clone https://github.com/Tomasraketak/HDR-Stacker.git
+cd HDR-Stacker
 py -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-python main.py
+.venv\Scripts\python -m pip install -r requirements.txt
 ```
 
-**macOS / Linux:**
+**Aktualizace** na nejnovější verzi:
+
+```bat
+cd HDR-Stacker
+git pull
+.venv\Scripts\python -m pip install --upgrade -r requirements.txt
+```
+
+**Spuštění:**
+
+```bat
+cd HDR-Stacker
+.venv\Scripts\python main.py
+```
+
+Místo spouštěcího příkazu stačí ve složce programu poklepat na **`run.bat`**. Když ještě
+není nic nainstalované, sám vytvoří virtuální prostředí, doinstaluje knihovny a spustí
+aplikaci. Při dalších spuštěních už jen spustí aplikaci.
+
+### macOS / Linux
+
+**Instalace** — jen poprvé:
 
 ```bash
-cd /cesta/k/HDR-Stacker
+git clone https://github.com/Tomasraketak/HDR-Stacker.git
+cd HDR-Stacker
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python3 main.py
+.venv/bin/python -m pip install -r requirements.txt
 ```
+
+**Aktualizace:**
+
+```bash
+cd HDR-Stacker
+git pull
+.venv/bin/python -m pip install --upgrade -r requirements.txt
+```
+
+**Spuštění:**
+
+```bash
+cd HDR-Stacker
+.venv/bin/python main.py
+```
+
+> **`cd HDR-Stacker`** platí ze složky, kde jste spustili `git clone`. Jinak napište celou
+> cestu, např. `cd C:\Users\Jmeno\HDR-Stacker`.
+>
+> **Bez Gitu:** na GitHubu klikněte na **Code → Download ZIP**, rozbalte a pokračujte od
+> příkazu `py -m venv .venv` (resp. `python3 -m venv .venv`). Aktualizace je pak nový ZIP
+> rozbalený přes starou složku a znovu příkaz `pip install` z aktualizace.
 
 > **Poznámka k Pythonu 3.13+:** PyQt6 a OpenCV pro něj nemusí mít připravené instalační
 > balíčky. Pokud instalace skončí chybou o „building wheel“, použijte Python 3.12.
@@ -142,16 +180,25 @@ nebo **`Nástroje → Časosběrný kompozit zatmění`** (`Ctrl+T`).
    disk (i z tenkého srpku — kružnice se proloží vnějším okrajem Slunce), vyřízne se a podle
    **času z EXIF** se umístí přesně tam, kde v tu chvíli Slunce na obloze bylo. Fotky
    částečných fází nemusí mít stejný záběr jako pozadí. Černé snímky bez Slunce se samy vypnou.
-4. **Jas a vzhled** — jas povrchu Slunce se u každé fotky **automaticky vyrovná** na
-   společnou hodnotu (posuvník **Jas povrchu**). U vybraného snímku ho doladíte posuvníkem
-   **Korekce jasu** (EV). Dál lze volit barvu (původní / sjednocená / neutrální / zlatavá),
-   prolnutí (Měsíc průhledný nebo černý), velikost Sluncí a zda zapadající Slunce schovat
-   za obzor.
-5. **Kontrola a doladění** — přes fotku se kreslí **denní dráha Slunce** s časovými
+4. **Vzhled** — jas povrchu Slunce se u každé fotky **automaticky vyrovná** na společnou
+   hodnotu. Dál lze volit barvu (původní / sjednocená / neutrální / zlatavá), prolnutí
+   (Měsíc průhledný nebo černý), velikost Sluncí a zda zapadající Slunce schovat za obzor.
+5. **Barvy a tóny** — **jas** (EV), **kontrast**, **střední tóny**, **saturace**,
+   **teplota** a **odstín** se nastavují na třech záložkách:
+   - **Všechna Slunce** (master) — jedním pohybem pro všechny srpky najednou;
+   - **Vybraný snímek** — jen pro jedno Slunce, **přičítá se** k masteru (master teplota
+     +30 a u snímku −10 dá u toho snímku +20); tady se dá i vypnout automatické vyrovnání jasu;
+   - **Pozadí** — snímek úplné fáze (korona, obloha, krajina).
+
+   Kontrast u Slunce pracuje kolem jasu jeho povrchu: přidáním se prohloubí okrajové
+   ztemnění a skvrny, ubráním se disk zploští. Černá zůstává černá, takže Měsíc
+   „ukusující“ Slunce nikdy nezešedne. Dvojklik na posuvník ho vrátí na 0,
+   **`↺ Vynulovat úpravy`** vynuluje celou záložku.
+6. **Kontrola a doladění** — přes fotku se kreslí **denní dráha Slunce** s časovými
    značkami, volitelně i **ekliptika**, vyznačený a vypočtený horizont a značky snímků.
    Každé Slunce jde **přetáhnout myší** nebo posunout šipkami (Shift = 5 px, Ctrl = 0,2 px);
    **`↺ Vrátit na vypočtenou polohu`** ruční posun zruší.
-6. **`💾 Exportovat kompozit`** vykreslí výsledek v plném rozlišení (TIFF 16 bit, PNG, JPEG).
+7. **`💾 Exportovat kompozit`** vykreslí výsledek v plném rozlišení (TIFF 16 bit, PNG, JPEG).
 
 Celé nastavení kompozitu se ukládá do projektu `.ahdrproj` spolu s HDR skládáním.
 
@@ -224,8 +271,10 @@ výpisu pod tlačítkem *Show Details*) a **běží dál** — rozpracovaná pr�
   horizon, Sun and solar diameter (weighted least squares), and every Sun is placed from its
   EXIF timestamp through a built-in solar ephemeris (Meeus, with refraction) — on synthetic
   data within 0.05 px over a 70-minute sequence. Crescents are fitted on the solar limb only,
-  surface brightness is equalised automatically with a per-frame EV correction, and the
-  Sun's daily path, time ticks and the ecliptic can be overlaid for checking.
+  surface brightness is equalised automatically, and exposure, contrast, mid-tones,
+  saturation, temperature and tint can be graded for all Suns at once, per frame on top of
+  that, and for the background. The tone curves pin black, so the Moon never turns grey.
+  The Sun's daily path, time ticks and the ecliptic can be overlaid for checking.
 - **Project files** — save the whole session (frames, per-frame alignment, exclusions,
   crop, every setting) to a small JSON `.ahdrproj` and reopen it exactly as it was.
   Paths are stored both absolutely and relative to the project, so moving a folder with
@@ -264,8 +313,9 @@ rapid ROI dragging, repeated worker cancellation, missing files, dialog cancel s
 an end-to-end full-resolution export, and closing the window with work in flight.
 The eclipse composite is checked against the Meeus reference examples and against a
 synthetic sky photographed by a known camera: disc detection on fat, thin and red
-crescents, camera recovery, placement accuracy, brightness equalisation, horizon clipping,
-project round-trips and the editor itself.
+crescents, camera recovery, placement accuracy, brightness equalisation, the master /
+per-frame / background colour grades, horizon clipping, project round-trips and the editor
+itself.
 
 ## 📋 Requirements
 

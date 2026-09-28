@@ -7,9 +7,11 @@ through the sky at its own timestamp. The user calibrates the background once
 — horizon, Sun, diameter — and the program draws the Sun's daily path (and the
 ecliptic, if wanted) over the photograph so the result can be checked by eye.
 
-Every Sun is also equalised to the same surface brightness automatically, with
-a per-frame EV correction on top, and can be nudged by hand: drag it on the
-canvas or use the arrow keys.
+Every Sun is also equalised to the same surface brightness automatically.
+Brightness, contrast, mid-tones, saturation, temperature and tint can then be
+set for all Suns at once (the master grade), for each frame on top of that,
+and for the totality background. Each Sun can be nudged by hand: drag it on
+the canvas or use the arrow keys.
 
 Heavy work (decoding a 24 Mpx background, finding the Sun in every partial
 frame, the full-resolution export) runs on background threads. The interactive
@@ -20,6 +22,7 @@ ever re-blends a handful of small cut-outs.
 import copy
 import math
 import os
+from dataclasses import astuple
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -32,13 +35,13 @@ from PyQt6.QtWidgets import (
     QPushButton, QComboBox, QDoubleSpinBox, QCheckBox, QScrollArea, QFrame,
     QSplitter, QProgressBar, QFileDialog, QMessageBox, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView, QDateEdit, QTimeEdit,
-    QSizePolicy
+    QSizePolicy, QTabWidget
 )
 
 try:
     from core.eclipse_composite import (
         CompositeSettings, CompositeError, PartialFrame, SunCutout, CalibrationReport,
-        Placement, load_image_float, detect_sun_disc, detect_totality_disc, cut_out_sun,
+        ColorGrade, Placement, apply_grade, load_image_float, detect_sun_disc, detect_totality_disc, cut_out_sun,
         calibrate, compute_placements, path_polyline, ecliptic_polyline,
         horizon_polyline, render_composite, frame_gains, format_time,
     )
@@ -51,7 +54,7 @@ try:
 except ImportError:  # pragma: no cover
     from ..core.eclipse_composite import (
         CompositeSettings, CompositeError, PartialFrame, SunCutout, CalibrationReport,
-        Placement, load_image_float, detect_sun_disc, detect_totality_disc, cut_out_sun,
+        ColorGrade, Placement, apply_grade, load_image_float, detect_sun_disc, detect_totality_disc, cut_out_sun,
         calibrate, compute_placements, path_polyline, ecliptic_polyline,
         horizon_polyline, render_composite, frame_gains, format_time,
     )
@@ -475,6 +478,59 @@ class DateTimeRow(QWidget):
         return datetime(d.year(), d.month(), d.day(), t.hour(), t.minute(), t.second())
 
 
+class GradeEditor(QWidget):
+    """Brightness, contrast, mid-tones, saturation and colour balance sliders."""
+
+    changed = pyqtSignal()
+
+    # attribute, label, lowest, highest, step, decimals, suffix, tooltip
+    SLIDERS = (
+        ("exposure", "Jas", -3.0, 3.0, 0.05, 2, " EV", "Jas v expozičních stupních (+1 EV = 2× jasnější)."),
+        ("contrast", "Kontrast", -100.0, 100.0, 1.0, 0, "",
+         "U Slunce se mění kolem jasu jeho povrchu: + prohloubí okrajové\n"
+         "ztemnění a skvrny, − obraz zploští."),
+        ("midtones", "Střední tóny", -100.0, 100.0, 1.0, 0, "",
+         "Zesvětlí nebo ztmaví střední tóny; černá i bílá zůstanou."),
+        ("saturation", "Saturace", -100.0, 100.0, 1.0, 0, "", "−100 = černobíle."),
+        ("temperature", "Teplota", -100.0, 100.0, 1.0, 0, "", "− chladnější (modřejší), + teplejší (žlutější)."),
+        ("tint", "Odstín", -100.0, 100.0, 1.0, 0, "", "− do zelena, + do purpurova."),
+    )
+
+    def __init__(self, hint: str = "", parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(2)
+        self.lbl_hint = QLabel(hint)
+        self.lbl_hint.setObjectName("StatusHint")
+        self.lbl_hint.setWordWrap(True)
+        self.lbl_hint.setVisible(bool(hint))
+        layout.addWidget(self.lbl_hint)
+        self.rows: Dict[str, SliderRow] = {}
+        for name, label, lo, hi, step, decimals, suffix, tip in self.SLIDERS:
+            row = SliderRow(label, lo, hi, 0.0, step=step, suffix=suffix,
+                            tip=tip + "\nDvojklik = 0.", decimals=decimals)
+            row.valueChanged.connect(lambda *_: self.changed.emit())
+            layout.addWidget(row)
+            self.rows[name] = row
+        self.btn_reset = QPushButton("↺  Vynulovat úpravy")
+        self.btn_reset.clicked.connect(self.reset)
+        layout.addWidget(self.btn_reset)
+
+    def set_grade(self, grade: ColorGrade):
+        """Shows `grade` without emitting `changed`."""
+        for name, row in self.rows.items():
+            _set_quiet(row, getattr(grade, name))
+
+    def write_into(self, grade: ColorGrade):
+        for name, row in self.rows.items():
+            setattr(grade, name, row.value())
+
+    def reset(self):
+        self.set_grade(ColorGrade())
+        self.changed.emit()
+
+
 def _spin(lo: float, hi: float, step: float, decimals: int, suffix: str = "",
           tip: str = "") -> QDoubleSpinBox:
     spin = QDoubleSpinBox()
@@ -516,6 +572,8 @@ class EclipseCompositeWindow(QDialog):
 
         self.settings = settings
         self._bg_proxy: Optional[np.ndarray] = None
+        self._bg_graded: Optional[np.ndarray] = None    # _bg_proxy with the background grade
+        self._bg_graded_key: Optional[tuple] = None
         self._bg_scale = 1.0
         self._bg_size = (0, 0)
         self._cutouts: Dict[str, Optional[SunCutout]] = {}
@@ -564,6 +622,7 @@ class EclipseCompositeWindow(QDialog):
         layout.addWidget(self._build_frames_group())
         layout.addWidget(self._build_selected_group())
         layout.addWidget(self._build_look_group())
+        layout.addWidget(self._build_grade_group())
         layout.addWidget(self._build_overlay_group())
         layout.addStretch()
         # Long option texts must not dictate the panel width; the popup list
@@ -790,16 +849,7 @@ class EclipseCompositeWindow(QDialog):
         self.lbl_frame_time.setWordWrap(True)
         grid.addWidget(self.lbl_frame_time, 1, 0, 1, 2)
 
-        self.chk_auto_bright = QCheckBox("Automaticky vyrovnat jas povrchu Slunce")
-        self.chk_auto_bright.toggled.connect(self._on_frame_edit)
-        grid.addWidget(self.chk_auto_bright, 2, 0, 1, 2)
-        self.slider_ev = SliderRow("Korekce jasu", -3.0, 3.0, 0.0, step=0.05, suffix=" EV",
-                                   tip="Doladění jasu tohoto Slunce nad automatické vyrovnání.\n"
-                                       "Dvojklik = 0.")
-        self.slider_ev.valueChanged.connect(self._on_frame_edit)
-        grid.addWidget(self.slider_ev, 3, 0, 1, 2)
-
-        grid.addWidget(QLabel("Ruční posun X / Y:"), 4, 0)
+        grid.addWidget(QLabel("Ruční posun X / Y:"), 2, 0)
         row = QHBoxLayout()
         self.spin_off_x = _spin(-20000.0, 20000.0, 0.5, 1, " px")
         self.spin_off_y = _spin(-20000.0, 20000.0, 0.5, 1, " px")
@@ -807,9 +857,9 @@ class EclipseCompositeWindow(QDialog):
         self.spin_off_y.valueChanged.connect(self._on_frame_edit)
         row.addWidget(self.spin_off_x, 1)
         row.addWidget(self.spin_off_y, 1)
-        grid.addLayout(row, 4, 1)
+        grid.addLayout(row, 2, 1)
 
-        grid.addWidget(QLabel("Otočení / velikost:"), 5, 0)
+        grid.addWidget(QLabel("Otočení / velikost:"), 3, 0)
         row2 = QHBoxLayout()
         self.spin_rot = _spin(-180.0, 180.0, 1.0, 1, "°", "Otočení srpku po směru hodin.")
         self.spin_scale = _spin(0.2, 5.0, 0.02, 2, "×", "Velikost tohoto Slunce navíc.")
@@ -817,12 +867,12 @@ class EclipseCompositeWindow(QDialog):
         self.spin_scale.valueChanged.connect(self._on_frame_edit)
         row2.addWidget(self.spin_rot, 1)
         row2.addWidget(self.spin_scale, 1)
-        grid.addLayout(row2, 5, 1)
+        grid.addLayout(row2, 3, 1)
 
         self.btn_reset_frame = QPushButton("↺  Vrátit na vypočtenou polohu")
         self.btn_reset_frame.setToolTip("Zruší ruční posun, otočení a změnu velikosti.")
         self.btn_reset_frame.clicked.connect(self._reset_frame_manual)
-        grid.addWidget(self.btn_reset_frame, 6, 0, 1, 2)
+        grid.addWidget(self.btn_reset_frame, 4, 0, 1, 2)
         grid.setColumnStretch(1, 1)
         return group
 
@@ -831,21 +881,15 @@ class EclipseCompositeWindow(QDialog):
         grid = QGridLayout(group)
         grid.setVerticalSpacing(6)
 
-        self.slider_level = SliderRow("Jas povrchu", 0.1, 1.0, 0.85, step=0.01,
-                                      tip="Cílový jas, na který se automaticky vyrovnají\n"
-                                          "všechny srpky (1 = plně bílá).")
-        self.slider_level.valueChanged.connect(self._on_look_changed)
-        grid.addWidget(self.slider_level, 0, 0, 1, 2)
-
         self.slider_size = SliderRow("Velikost Sluncí", 0.5, 4.0, 1.0, step=0.05, suffix="×",
                                      tip="1× = skutečná velikost Slunce vůči krajině.")
         self.slider_size.valueChanged.connect(self._on_look_changed)
-        grid.addWidget(self.slider_size, 1, 0, 1, 2)
+        grid.addWidget(self.slider_size, 0, 0, 1, 2)
 
         self.slider_soft = SliderRow("Měkkost okraje", 0.0, 0.2, 0.04, step=0.01,
                                      tip="Prolnutí okraje vyříznutého disku s oblohou.")
         self.slider_soft.valueChanged.connect(self._on_look_changed)
-        grid.addWidget(self.slider_soft, 2, 0, 1, 2)
+        grid.addWidget(self.slider_soft, 1, 0, 1, 2)
 
         def combo(label, row, entries, tip=""):
             grid.addWidget(QLabel(label), row, 0)
@@ -858,19 +902,19 @@ class EclipseCompositeWindow(QDialog):
             grid.addWidget(box, row, 1)
             return box
 
-        self.combo_color = combo("Barva:", 3, (
+        self.combo_color = combo("Barva:", 2, (
             ("Původní (jak je vyfoceno)", "original"),
             ("Sjednotit podle většiny snímků", "unify"),
             ("Neutrální bílá", "neutral"),
             ("Zlatavá", "golden"),
         ), "Sjednocení přebarví jas pixelů jedním odstínem — nezesiluje šum.")
-        self.combo_blend = combo("Prolnutí:", 4, (
+        self.combo_blend = combo("Prolnutí:", 3, (
             ("Zesvětlit (Měsíc průhledný)", "lighten"),
             ("Závoj (screen)", "screen"),
             ("Normální (černý Měsíc)", "normal"),
         ), "Zesvětlit: zakrytá část ukazuje oblohu pozadí.\n"
            "Normální: zakrytá část je černá silueta Měsíce.")
-        self.combo_orient = combo("Natočení srpků:", 5, (
+        self.combo_orient = combo("Natočení srpků:", 4, (
             ("Jak byly vyfoceny", "as_shot"),
             ("Srovnat na horizont (fotky byly vodorovně)", "level"),
         ), "Srovnat: otočí srpky podle místního směru k zenitu v pozadí.\n"
@@ -879,8 +923,49 @@ class EclipseCompositeWindow(QDialog):
         self.chk_clip = QCheckBox("Nekreslit Slunce pod horizontem")
         self.chk_clip.setToolTip("Zapadající Slunce se schová za vyznačený obzor.")
         self.chk_clip.toggled.connect(self._on_look_changed)
-        grid.addWidget(self.chk_clip, 6, 0, 1, 2)
+        grid.addWidget(self.chk_clip, 5, 0, 1, 2)
         grid.setColumnStretch(1, 1)
+        return group
+
+    def _build_grade_group(self) -> QGroupBox:
+        group = QGroupBox("5 · Barvy a tóny")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(6, 10, 6, 6)
+        self.grade_tabs = QTabWidget()
+        self.grade_tabs.setUsesScrollButtons(True)
+
+        self.grade_master = GradeEditor("Platí pro všechna Slunce najednou. Úpravy jednotlivých "
+                                        "snímků se k nim přičítají.")
+        self.grade_master.changed.connect(self._on_master_grade)
+        self.grade_tabs.addTab(self.grade_master, "Všechna Slunce")
+
+        self.frame_grade_tab = QWidget()
+        frame_layout = QVBoxLayout(self.frame_grade_tab)
+        frame_layout.setContentsMargins(0, 6, 0, 0)
+        frame_layout.setSpacing(2)
+        top = QVBoxLayout()
+        top.setContentsMargins(8, 0, 8, 0)
+        self.lbl_grade_frame = QLabel("")
+        self.lbl_grade_frame.setObjectName("StatusHint")
+        self.lbl_grade_frame.setWordWrap(True)
+        top.addWidget(self.lbl_grade_frame)
+        self.chk_auto_bright = QCheckBox("Automaticky vyrovnat jas povrchu Slunce")
+        self.chk_auto_bright.setToolTip("Srovná jas povrchu tohoto Slunce s ostatními.\n"
+                                        "Posuvník Jas pak doladí rozdíl navíc.")
+        self.chk_auto_bright.toggled.connect(self._on_frame_grade)
+        top.addWidget(self.chk_auto_bright)
+        frame_layout.addLayout(top)
+        self.grade_frame = GradeEditor()
+        self.grade_frame.changed.connect(self._on_frame_grade)
+        frame_layout.addWidget(self.grade_frame)
+        self.grade_tabs.addTab(self.frame_grade_tab, "Vybraný snímek")
+
+        self.grade_background = GradeEditor("Snímek úplné fáze pod Slunci: korona, obloha "
+                                            "i krajina.")
+        self.grade_background.changed.connect(self._on_background_grade)
+        self.grade_tabs.addTab(self.grade_background, "Pozadí")
+
+        layout.addWidget(self.grade_tabs)
         return group
 
     def _build_overlay_group(self) -> QGroupBox:
@@ -971,7 +1056,8 @@ class EclipseCompositeWindow(QDialog):
                 idx = combo.findData(value)
                 combo.setCurrentIndex(max(0, idx))
                 combo.blockSignals(False)
-            _set_quiet(self.slider_level, s.target_level)
+            self.grade_master.set_grade(s.sun_grade)
+            self.grade_background.set_grade(s.background_grade)
             _set_quiet(self.slider_size, s.size_multiplier)
             _set_quiet(self.slider_soft, s.edge_softness)
             _set_quiet(self.chk_clip, s.clip_below_horizon)
@@ -1094,6 +1180,7 @@ class EclipseCompositeWindow(QDialog):
         if result.get("path") != self.settings.background_path:
             return  # a newer background was chosen meanwhile
         self._bg_proxy = result["proxy"]
+        self._bg_graded = None
         self._bg_scale = float(result["scale"])
         self._bg_size = (int(result["width"]), int(result["height"]))
         s = self.settings
@@ -1429,10 +1516,14 @@ class EclipseCompositeWindow(QDialog):
     def _load_selected_into_editor(self):
         frame = self._current_frame()
         self.selected_group.setEnabled(frame is not None)
+        self.frame_grade_tab.setEnabled(frame is not None)
         if frame is None:
             self.selected_group.setTitle("Vybraný snímek")
+            self.lbl_grade_frame.setText("Vyberte snímek v tabulce nebo klikněte na jeho Slunce.")
             return
         self.selected_group.setTitle(f"Vybraný snímek #{self._selected + 1}: {frame.filename}")
+        self.lbl_grade_frame.setText(f"Snímek #{self._selected + 1}: {frame.filename} — "
+                                     f"přičítá se k úpravám všech Sluncí.")
         self._syncing = True
         try:
             moment = frame.moment
@@ -1445,7 +1536,7 @@ class EclipseCompositeWindow(QDialog):
             else:
                 self.lbl_frame_time.setText("Čas zadán ručně.")
             _set_quiet(self.chk_auto_bright, frame.auto_brightness)
-            _set_quiet(self.slider_ev, frame.ev_adjust)
+            self.grade_frame.set_grade(frame.grade)
             _set_quiet(self.spin_off_x, frame.offset_x)
             _set_quiet(self.spin_off_y, frame.offset_y)
             _set_quiet(self.spin_rot, frame.rotation)
@@ -1467,8 +1558,6 @@ class EclipseCompositeWindow(QDialog):
         frame = self._current_frame()
         if frame is None or self._syncing:
             return
-        frame.auto_brightness = self.chk_auto_bright.isChecked()
-        frame.ev_adjust = self.slider_ev.value()
         frame.offset_x = self.spin_off_x.value()
         frame.offset_y = self.spin_off_y.value()
         frame.rotation = self.spin_rot.value()
@@ -1535,13 +1624,45 @@ class EclipseCompositeWindow(QDialog):
             return
         super().keyPressEvent(event)
 
+    # ============================================================= Grades
+
+    def _on_master_grade(self):
+        if self._syncing:
+            return
+        self.grade_master.write_into(self.settings.sun_grade)
+        self._schedule_render()
+
+    def _on_frame_grade(self, *_):
+        frame = self._current_frame()
+        if frame is None or self._syncing:
+            return
+        frame.auto_brightness = self.chk_auto_bright.isChecked()
+        self.grade_frame.write_into(frame.grade)
+        self._schedule_render()
+
+    def _on_background_grade(self):
+        if self._syncing:
+            return
+        self.grade_background.write_into(self.settings.background_grade)
+        self._schedule_render()
+
+    def _graded_background(self) -> Optional[np.ndarray]:
+        """The preview background with its grade, re-graded only when that changes."""
+        if self._bg_proxy is None:
+            return None
+        grade = self.settings.background_grade
+        key = astuple(grade)
+        if self._bg_graded is None or self._bg_graded_key != key:
+            self._bg_graded = apply_grade(self._bg_proxy, grade)
+            self._bg_graded_key = key
+        return self._bg_graded
+
     # ============================================================== Look
 
     def _on_look_changed(self, *_):
         if self._syncing:
             return
         s = self.settings
-        s.target_level = self.slider_level.value()
         s.size_multiplier = self.slider_size.value()
         s.edge_softness = self.slider_soft.value()
         s.color_mode = self.combo_color.currentData() or "original"
@@ -1621,12 +1742,13 @@ class EclipseCompositeWindow(QDialog):
         else:
             self._placements = [None] * len(s.frames)
 
-        if self._bg_proxy is not None:
+        background = self._graded_background()
+        if background is not None:
             if self._report is not None:
-                image = render_composite(self._bg_proxy, s, cutouts, self._report.camera,
-                                         scale=self._bg_scale)
+                image = render_composite(background, s, cutouts, self._report.camera,
+                                         scale=self._bg_scale, background_graded=True)
             else:
-                image = self._bg_proxy
+                image = background
             self.canvas.set_original_size(*self._bg_size)
             self.canvas.set_base_image_bgr_float(image, keep_view=not self._first_image)
             self._first_image = False
